@@ -33,6 +33,9 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # Number of query heads to treat as global (full causal attention). Remaining heads use sliding window.
+    # Set to 0 to disable global heads (all local), set to n_head for all global.
+    n_global_head: int = 0
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -62,16 +65,32 @@ class CausalSelfAttention(nn.Module):
         self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
+        self.n_global_head = config.n_global_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        assert 0 <= self.n_global_head <= self.n_head
+        if 0 < self.n_global_head < self.n_head:
+            q_per_kv = self.n_head // self.n_kv_head
+            assert self.n_global_head % q_per_kv == 0, "n_global_head must align to GQA groups"
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.pred_sub_proj = None
+        self.pred_sub_scale = None
+        if 0 < self.n_global_head < self.n_head:
+            n_local_head = self.n_head - self.n_global_head
+            self.pred_sub_proj = nn.Linear(
+                self.n_global_head * self.head_dim,
+                n_local_head * self.head_dim,
+                bias=False,
+            )
+            # Learnable scale for predictive subtraction (init small for stability).
+            self.pred_sub_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -95,22 +114,84 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.n_global_head == 0:
+            # All local heads
+            if kv_cache is None:
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+        elif self.n_global_head == self.n_head:
+            # All global heads (full causal context)
+            global_window = (-1, 0)
+            if kv_cache is None:
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=global_window)
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=global_window,
+                )
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # Split heads: global (full context) + local (sliding window)
+            q_per_kv = self.n_head // self.n_kv_head
+            n_global_kv = self.n_global_head // q_per_kv
+            global_window = (-1, 0)
+            q_global, q_local = q[:, :, :self.n_global_head, :], q[:, :, self.n_global_head:, :]
+            k_global, k_local = k[:, :, :n_global_kv, :], k[:, :, n_global_kv:, :]
+            v_global, v_local = v[:, :, :n_global_kv, :], v[:, :, n_global_kv:, :]
+            if kv_cache is None:
+                y_global = flash_attn.flash_attn_func(
+                    q_global, k_global, v_global,
+                    causal=True, window_size=global_window,
+                )
+                y_local = flash_attn.flash_attn_func(
+                    q_local, k_local, v_local,
+                    causal=True, window_size=window_size,
+                )
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                k_cache_global, k_cache_local = k_cache[:, :, :n_global_kv, :], k_cache[:, :, n_global_kv:, :]
+                v_cache_global, v_cache_local = v_cache[:, :, :n_global_kv, :], v_cache[:, :, n_global_kv:, :]
+                k_global_new, k_local_new = k[:, :, :n_global_kv, :], k[:, :, n_global_kv:, :]
+                v_global_new, v_local_new = v[:, :, :n_global_kv, :], v[:, :, n_global_kv:, :]
+                y_global = flash_attn.flash_attn_with_kvcache(
+                    q_global, k_cache_global, v_cache_global,
+                    k=k_global_new, v=v_global_new,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=global_window,
+                )
+                y_local = flash_attn.flash_attn_with_kvcache(
+                    q_local, k_cache_local, v_cache_local,
+                    k=k_local_new, v=v_local_new,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+            if self.pred_sub_proj is not None:
+                # Predict local features from global heads and subtract in head space.
+                y_global_flat = y_global.contiguous().view(B, T, -1)
+                y_pred_local = self.pred_sub_proj(y_global_flat).view(
+                    B, T, self.n_head - self.n_global_head, self.head_dim
+                )
+                y_local = y_local - self.pred_sub_scale * y_pred_local
+            y = torch.cat([y_global, y_local], dim=2)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -308,11 +389,18 @@ class GPT(nn.Module):
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
+        n_global = self.config.n_global_head
+        n_local = h - n_global
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+            local_seq = t if window < 0 else min(window, t)
+            if n_global == 0:
+                attn_flops += 12 * h * q * local_seq
+            elif n_global == h:
+                attn_flops += 12 * h * q * t
+            else:
+                attn_flops += 12 * q * (n_global * t + n_local * local_seq)
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
 

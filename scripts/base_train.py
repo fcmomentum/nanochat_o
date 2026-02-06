@@ -51,6 +51,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--global-head-pct", type=float, default=25.0, help="percentage of attention heads to use as global (full context); remaining are local")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -122,6 +123,22 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
+def _compute_global_heads(num_heads, num_kv_heads, global_head_pct):
+    pct = max(0.0, min(100.0, global_head_pct))
+    raw = int(round(num_heads * (pct / 100.0)))
+    if raw <= 0:
+        return 0
+    if raw >= num_heads:
+        return num_heads
+    q_per_kv = num_heads // num_kv_heads
+    aligned = (raw // q_per_kv) * q_per_kv
+    if aligned == 0:
+        aligned = q_per_kv
+    if aligned != raw:
+        print0(f"Adjusted n_global_head from {raw} to {aligned} to align with GQA groups")
+    return aligned
+
+
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
@@ -129,9 +146,12 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    num_kv_heads = num_heads
+    n_global_head = _compute_global_heads(num_heads, num_kv_heads, args.global_head_pct)
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
+        n_global_head=n_global_head,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
