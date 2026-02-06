@@ -16,6 +16,15 @@ Usage (drop-in replacement for FA3):
 import torch
 import torch.nn.functional as F
 
+try:
+    from torch.nn.attention import flex_attention as _flex_attention
+    from torch.nn.attention import create_block_mask as _create_block_mask
+    HAS_FLEX_ATTENTION = True
+except Exception:
+    _flex_attention = None
+    _create_block_mask = None
+    HAS_FLEX_ATTENTION = False
+
 
 # =============================================================================
 # Detection: Try to load FA3 on Hopper+ GPUs
@@ -58,6 +67,54 @@ def _use_fa3():
 # =============================================================================
 # SDPA helpers
 # =============================================================================
+_flex_block_mask_cache = {}
+
+def _get_flex_block_mask(q_len, kv_len, window, device, batch_size, num_heads):
+    key = (q_len, kv_len, window, device.type, device.index, batch_size, num_heads)
+    block_mask = _flex_block_mask_cache.get(key)
+    if block_mask is not None:
+        return block_mask
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= window)
+
+    try:
+        block_mask = _create_block_mask(
+            mask_mod=mask_mod,
+            B=batch_size,
+            H=num_heads,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+    except TypeError:
+        # Fallback for older/newer signatures
+        block_mask = _create_block_mask(mask_mod, batch_size, num_heads, q_len, kv_len, device=device)
+
+    _flex_block_mask_cache[key] = block_mask
+    return block_mask
+
+
+def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
+    if not HAS_FLEX_ATTENTION:
+        return None
+    Tq = q.size(2)
+    Tk = k.size(2)
+    window = window_size[0]
+    if Tq != Tk:
+        return None
+    if window < 0 or window >= Tq:
+        return None
+    block_mask = _get_flex_block_mask(Tq, Tk, window, q.device, q.size(0), q.size(1))
+    try:
+        return _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+    except TypeError:
+        try:
+            return _flex_attention(q, k, v, block_mask)
+        except Exception:
+            return None
+
+
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
     SDPA attention with sliding window support.
@@ -79,6 +136,12 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             k = k[:, :, start:, :]
             v = v[:, :, start:, :]
         return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+
+    # Sliding window (training / full-length) via FlexAttention if available
+    if window >= 0 and window < Tq and Tq == Tk:
+        y_flex = _flex_attention_sliding_window(q, k, v, window_size, enable_gqa)
+        if y_flex is not None:
+            return y_flex
 
     # Need explicit mask for sliding window/chunk inference
     device = q.device
