@@ -73,8 +73,15 @@ def _use_fa3():
 # SDPA helpers
 # =============================================================================
 _flex_block_mask_cache = {}
-_flex_debug_enabled = bool(int(os.environ.get("NANOCHAT_FLEX_DEBUG", "0"))) if "os" in globals() else False
+_flex_debug_enabled = bool(int(os.environ.get("NANOCHAT_FLEX_DEBUG", "0")))
 _flex_debug_printed = False
+_flex_debug_reasons = set()
+
+def _flex_debug_log(reason):
+    if not _flex_debug_enabled or reason in _flex_debug_reasons:
+        return
+    print(f"[flex_attention] skipped: {reason}")
+    _flex_debug_reasons.add(reason)
 
 def _get_flex_block_mask(q_len, kv_len, window, device, batch_size, num_heads):
     key = (q_len, kv_len, window, device.type, device.index, batch_size, num_heads)
@@ -105,13 +112,16 @@ def _get_flex_block_mask(q_len, kv_len, window, device, batch_size, num_heads):
 def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
     global _flex_debug_printed
     if not HAS_FLEX_ATTENTION:
+        _flex_debug_log("HAS_FLEX_ATTENTION is False (import failed)")
         return None
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
     if Tq != Tk:
+        _flex_debug_log(f"Tq != Tk (Tq={Tq}, Tk={Tk})")
         return None
     if window < 0 or window >= Tq:
+        _flex_debug_log(f"window not in [0, Tq) (window={window}, Tq={Tq})")
         return None
     block_mask = _get_flex_block_mask(Tq, Tk, window, q.device, q.size(0), q.size(1))
     try:
@@ -120,6 +130,7 @@ def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
         try:
             y = _flex_attention(q, k, v, block_mask)
         except Exception:
+            _flex_debug_log("flex_attention call failed (exception)")
             return None
     if _flex_debug_enabled and not _flex_debug_printed:
         print(f"[flex_attention] enabled for sliding window: T={Tq}, window={window}")
