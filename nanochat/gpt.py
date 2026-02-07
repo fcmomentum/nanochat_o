@@ -154,14 +154,24 @@ class CausalSelfAttention(nn.Module):
             k_global, k_local = k[:, :, :n_global_kv, :], k[:, :, n_global_kv:, :]
             v_global, v_local = v[:, :, :n_global_kv, :], v[:, :, n_global_kv:, :]
             if kv_cache is None:
-                y_global = flash_attn.flash_attn_func(
-                    q_global, k_global, v_global,
-                    causal=True, window_size=global_window,
-                )
-                y_local = flash_attn.flash_attn_func(
-                    q_local, k_local, v_local,
-                    causal=True, window_size=window_size,
-                )
+                y = None
+                if self.n_kv_head == self.n_head:
+                    # Attempt single-call FlexAttention with per-head mask.
+                    y = flash_attn.flash_attn_func_split_heads(
+                        q, k, v, self.n_global_head, window_size=window_size
+                    )
+                if y is None:
+                    y_global = flash_attn.flash_attn_func(
+                        q_global, k_global, v_global,
+                        causal=True, window_size=global_window,
+                    )
+                    y_local = flash_attn.flash_attn_func(
+                        q_local, k_local, v_local,
+                        causal=True, window_size=window_size,
+                    )
+                else:
+                    y_global = y[:, :, :self.n_global_head, :]
+                    y_local = y[:, :, self.n_global_head:, :]
             else:
                 k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
                 k_cache_global, k_cache_local = k_cache[:, :, :n_global_kv, :], k_cache[:, :, n_global_kv:, :]

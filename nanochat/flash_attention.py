@@ -114,6 +114,34 @@ def _get_flex_block_mask(q_len, kv_len, window, device, batch_size, num_heads):
     return block_mask
 
 
+def _get_flex_block_mask_split(q_len, kv_len, window, device, batch_size, num_heads, n_global_head):
+    key = (q_len, kv_len, window, device.type, device.index, batch_size, num_heads, n_global_head)
+    block_mask = _flex_block_mask_cache.get(key)
+    if block_mask is not None:
+        return block_mask
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        if h < n_global_head:
+            return causal
+        return causal & ((q_idx - kv_idx) <= window)
+
+    try:
+        block_mask = _create_block_mask(
+            mask_mod=mask_mod,
+            B=batch_size,
+            H=num_heads,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+    except TypeError:
+        block_mask = _create_block_mask(mask_mod, batch_size, num_heads, q_len, kv_len, device=device)
+
+    _flex_block_mask_cache[key] = block_mask
+    return block_mask
+
+
 def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
     global _flex_debug_printed
     if not HAS_FLEX_ATTENTION:
@@ -188,6 +216,38 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 # =============================================================================
+# FlexAttention split-head helper (single-call, per-head mask)
+# =============================================================================
+def _flex_attention_split_heads(q, k, v, window_size, n_global_head):
+    if not HAS_FLEX_ATTENTION:
+        _flex_debug_log("HAS_FLEX_ATTENTION is False (import failed)")
+        return None
+    Tq = q.size(2)
+    Tk = k.size(2)
+    window = window_size[0]
+    if Tq != Tk:
+        _flex_debug_log(f"split: Tq != Tk (Tq={Tq}, Tk={Tk})")
+        return None
+    if window < 0 or window >= Tq:
+        _flex_debug_log(f"split: window not in [0, Tq) (window={window}, Tq={Tq})")
+        return None
+    if not (0 < n_global_head < q.size(1)):
+        _flex_debug_log("split: n_global_head not in (0, num_heads)")
+        return None
+    block_mask = _get_flex_block_mask_split(Tq, Tk, window, q.device, q.size(0), q.size(1), n_global_head)
+    try:
+        return _flex_attention_fn(q, k, v, block_mask=block_mask, enable_gqa=False)
+    except TypeError:
+        try:
+            return _flex_attention_fn(q, k, v, block_mask)
+        except Exception:
+            if _flex_debug_enabled:
+                import traceback
+                traceback.print_exc()
+            _flex_debug_log("split: flex_attention call failed (exception)")
+            return None
+
+# =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
@@ -213,6 +273,27 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     y = _sdpa_attention(q, k, v, window_size, enable_gqa)
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
+
+def flash_attn_func_split_heads(q, k, v, n_global_head, window_size=(-1, -1)):
+    """
+    FlexAttention single-call path for split-head sliding window (training only).
+    Returns None if FlexAttention is unavailable or conditions aren't met.
+
+    Args:
+        q, k, v: (B, T, H, D) with H == H_kv (no GQA)
+        n_global_head: number of heads with full causal context
+        window_size: (left, right) sliding window. right ignored (causal only)
+    """
+    if not HAS_FLEX_ATTENTION:
+        return None
+    # Transpose to (B, H, T, D)
+    q_sdpa = q.transpose(1, 2)
+    k_sdpa = k.transpose(1, 2)
+    v_sdpa = v.transpose(1, 2)
+    y_sdpa = _flex_attention_split_heads(q_sdpa, k_sdpa, v_sdpa, window_size, n_global_head)
+    if y_sdpa is None:
+        return None
+    return y_sdpa.transpose(1, 2)
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
@@ -270,4 +351,5 @@ from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
+    flash_attn_func_split_heads=flash_attn_func_split_heads,
 )
