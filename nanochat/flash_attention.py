@@ -122,9 +122,9 @@ def _get_flex_block_mask_split(q_len, kv_len, window, device, batch_size, num_he
 
     def mask_mod(b, h, q_idx, kv_idx):
         causal = q_idx >= kv_idx
-        if h < n_global_head:
-            return causal
-        return causal & ((q_idx - kv_idx) <= window)
+        # Keep this branch tensorized so vmap/functorch can trace it.
+        global_head = h < n_global_head
+        return causal & (global_head | ((q_idx - kv_idx) <= window))
 
     try:
         block_mask = _create_block_mask(
