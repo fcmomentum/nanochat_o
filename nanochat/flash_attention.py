@@ -13,6 +13,7 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
 import torch
 import torch.nn.functional as F
 
@@ -68,6 +69,8 @@ def _use_fa3():
 # SDPA helpers
 # =============================================================================
 _flex_block_mask_cache = {}
+_flex_debug_enabled = bool(int(os.environ.get("NANOCHAT_FLEX_DEBUG", "0"))) if "os" in globals() else False
+_flex_debug_printed = False
 
 def _get_flex_block_mask(q_len, kv_len, window, device, batch_size, num_heads):
     key = (q_len, kv_len, window, device.type, device.index, batch_size, num_heads)
@@ -96,6 +99,7 @@ def _get_flex_block_mask(q_len, kv_len, window, device, batch_size, num_heads):
 
 
 def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
+    global _flex_debug_printed
     if not HAS_FLEX_ATTENTION:
         return None
     Tq = q.size(2)
@@ -107,12 +111,16 @@ def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
         return None
     block_mask = _get_flex_block_mask(Tq, Tk, window, q.device, q.size(0), q.size(1))
     try:
-        return _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+        y = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
     except TypeError:
         try:
-            return _flex_attention(q, k, v, block_mask)
+            y = _flex_attention(q, k, v, block_mask)
         except Exception:
             return None
+    if _flex_debug_enabled and not _flex_debug_printed:
+        print(f"[flex_attention] enabled for sliding window: T={Tq}, window={window}")
+        _flex_debug_printed = True
+    return y
 
 
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
