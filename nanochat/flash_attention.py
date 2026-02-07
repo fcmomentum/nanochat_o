@@ -18,9 +18,13 @@ import torch
 import torch.nn.functional as F
 
 try:
+    # Newer PyTorch exposes flex_attention as a module with create_block_mask inside.
     from torch.nn.attention import flex_attention as _flex_attention
-    from torch.nn.attention import create_block_mask as _create_block_mask
-    HAS_FLEX_ATTENTION = True
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
+    except Exception:
+        _create_block_mask = getattr(_flex_attention, "create_block_mask", None)
+    HAS_FLEX_ATTENTION = _create_block_mask is not None
 except Exception:
     _flex_attention = None
     _create_block_mask = None
