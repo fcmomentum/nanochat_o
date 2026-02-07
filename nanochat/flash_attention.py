@@ -24,11 +24,16 @@ try:
         from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
     except Exception:
         _create_block_mask = getattr(_flex_attention, "create_block_mask", None)
-    HAS_FLEX_ATTENTION = _create_block_mask is not None
+    if callable(_flex_attention):
+        _flex_attention_fn = _flex_attention
+    else:
+        _flex_attention_fn = getattr(_flex_attention, "flex_attention", None)
+    HAS_FLEX_ATTENTION = _create_block_mask is not None and _flex_attention_fn is not None
 except Exception:
     _flex_attention = None
     _create_block_mask = None
     HAS_FLEX_ATTENTION = False
+    _flex_attention_fn = None
 
 
 # =============================================================================
@@ -125,11 +130,14 @@ def _flex_attention_sliding_window(q, k, v, window_size, enable_gqa):
         return None
     block_mask = _get_flex_block_mask(Tq, Tk, window, q.device, q.size(0), q.size(1))
     try:
-        y = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+        y = _flex_attention_fn(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
     except TypeError:
         try:
-            y = _flex_attention(q, k, v, block_mask)
+            y = _flex_attention_fn(q, k, v, block_mask)
         except Exception:
+            if _flex_debug_enabled:
+                import traceback
+                traceback.print_exc()
             _flex_debug_log("flex_attention call failed (exception)")
             return None
     if _flex_debug_enabled and not _flex_debug_printed:
