@@ -513,12 +513,14 @@ while True:
     t0 = time.time()
     dino_aux_loss_f = 0.0
     ce_loss_f = 0.0
+    dino_active_f = 0.0
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss, loss_breakdown = model(x, y, return_loss_breakdown=True)
         train_loss = loss.detach() # for logging
         ce_loss_f += loss_breakdown["ce_loss"].detach().item()
         dino_aux_loss_f += loss_breakdown["dino_aux_loss"].detach().item()
+        dino_active_f += loss_breakdown["dino_active"].detach().item()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -535,6 +537,7 @@ while True:
     model.zero_grad(set_to_none=True)
     ce_loss_f /= grad_accum_steps
     dino_aux_loss_f /= grad_accum_steps
+    dino_active_f /= grad_accum_steps
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -570,6 +573,8 @@ while True:
             "train/loss": debiased_smooth_loss,
             "train/ce_loss": ce_loss_f,
             "train/dino_aux_loss": dino_aux_loss_f,
+            "train/dino_active": dino_active_f,
+            "train/dino_weighted_loss": dino_aux_loss_f * args.dino_weight,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
