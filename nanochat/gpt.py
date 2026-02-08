@@ -40,6 +40,20 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Predictive subtraction layers for mixed-head attention.
+    # Options: "all", "none", or comma-separated 0-based indices/ranges (e.g. "4-9,11").
+    pred_sub_layers: str = "all"
+    # If True, disable predictive subtraction on full-context (L) layers.
+    pred_sub_skip_full_layers: bool = False
+    # Optional DINO-style auxiliary loss for split-head layers.
+    # dino_layer: 0-based layer index, -1 disables.
+    # dino_delta: predict teacher features at t + delta from student features at t.
+    dino_layer: int = -1
+    dino_delta: int = 1
+    dino_weight: float = 0.0
+    dino_student_temp: float = 0.1
+    dino_teacher_temp: float = 0.04
+    dino_mask_ratio: float = 0.0
 
 
 def norm(x):
@@ -60,7 +74,7 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, enable_pred_sub, enable_dino):
         super().__init__()
         self.layer_idx = layer_idx
         self.n_head = config.n_head
@@ -82,7 +96,10 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         self.pred_sub_proj = None
         self.pred_sub_scale = None
-        if 0 < self.n_global_head < self.n_head:
+        self.dino_local_proj = None
+        self.dino_teacher_dim = self.n_global_head * self.head_dim
+        self.dino_mask_ratio = float(config.dino_mask_ratio)
+        if enable_pred_sub and 0 < self.n_global_head < self.n_head:
             n_local_head = self.n_head - self.n_global_head
             self.pred_sub_proj = nn.Linear(
                 self.n_global_head * self.head_dim,
@@ -91,8 +108,15 @@ class CausalSelfAttention(nn.Module):
             )
             # Learnable scale for predictive subtraction (init small for stability).
             self.pred_sub_scale = nn.Parameter(torch.tensor(0.1))
+        if enable_dino and 0 < self.n_global_head < self.n_head:
+            n_local_head = self.n_head - self.n_global_head
+            self.dino_local_proj = nn.Linear(
+                n_local_head * self.head_dim,
+                self.n_global_head * self.head_dim,
+                bias=False,
+            )
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -201,11 +225,28 @@ class CausalSelfAttention(nn.Module):
                     B, T, self.n_head - self.n_global_head, self.head_dim
                 )
                 y_local = y_local - self.pred_sub_scale * y_pred_local
+            dino_pair = None
+            if capture_dino and self.dino_local_proj is not None:
+                local_for_dino = y_local
+                if self.training and self.dino_mask_ratio > 0.0:
+                    keep_prob = 1.0 - self.dino_mask_ratio
+                    n_local_head = self.n_head - self.n_global_head
+                    # Mask whole local heads in the aux branch so the student must infer missing structure.
+                    head_mask = (torch.rand(B, T, n_local_head, 1, device=y_local.device) < keep_prob).to(y_local.dtype)
+                    local_for_dino = local_for_dino * head_mask / max(keep_prob, 1e-6)
+                local_flat = local_for_dino.contiguous().view(B, T, -1)
+                global_flat = y_global.contiguous().view(B, T, -1)
+                dino_pair = {
+                    "student": self.dino_local_proj(local_flat),
+                    "teacher": global_flat,
+                }
             y = torch.cat([y_global, y_local], dim=2)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
+        if capture_dino and self.n_global_head < self.n_head:
+            return y, dino_pair if "dino_pair" in locals() else None
         return y
 
 
@@ -223,14 +264,20 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, enable_pred_sub, enable_dino):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config, layer_idx, enable_pred_sub, enable_dino)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
+        attn_out = self.attn(norm(x), ve, cos_sin, window_size, kv_cache, capture_dino=capture_dino)
+        dino_pair = None
+        if capture_dino:
+            attn_out, dino_pair = attn_out
+        x = x + attn_out
         x = x + self.mlp(norm(x))
+        if capture_dino:
+            return x, dino_pair
         return x
 
 
@@ -248,6 +295,27 @@ class GPT(nn.Module):
         self.window_sizes = self._compute_window_sizes(config)
         schedule = ", ".join(f"L{i}:{w[0]}" for i, w in enumerate(self.window_sizes))
         print0(f"Attention window schedule (left context): {schedule}")
+        self.pred_sub_layers = self._compute_pred_sub_layers(config)
+        if self.pred_sub_layers:
+            pred_sub_str = ", ".join(str(i) for i in sorted(self.pred_sub_layers))
+        else:
+            pred_sub_str = "none"
+        print0(f"Predictive subtraction layers: {pred_sub_str}")
+        self.dino_layer = int(config.dino_layer)
+        self.dino_enabled = config.dino_weight > 0.0 and self.dino_layer >= 0
+        if self.dino_enabled:
+            assert 0 <= self.dino_layer < config.n_layer, f"dino_layer out of bounds: {self.dino_layer}"
+            assert 0 < config.n_global_head < config.n_head, (
+                "DINO aux requires split heads: set global_head_pct so 0 < n_global_head < n_head"
+            )
+            assert config.dino_delta > 0, "dino_delta must be > 0"
+            assert 0.0 <= config.dino_mask_ratio < 1.0, "dino_mask_ratio must be in [0, 1)"
+            print0(
+                f"DINO aux enabled at layer {self.dino_layer} "
+                f"(delta={config.dino_delta}, weight={config.dino_weight}, mask={config.dino_mask_ratio})"
+            )
+        else:
+            print0("DINO aux disabled")
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -255,7 +323,15 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([
+                Block(
+                    config,
+                    layer_idx,
+                    layer_idx in self.pred_sub_layers,
+                    layer_idx == self.dino_layer and self.dino_enabled,
+                )
+                for layer_idx in range(config.n_layer)
+            ]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -378,6 +454,43 @@ class GPT(nn.Module):
         # Final layer always gets full context
         window_sizes[-1] = (long_window, 0)
         return window_sizes
+
+    def _compute_pred_sub_layers(self, config):
+        """
+        Parse predictive subtraction layer spec into a set of 0-based layer indices.
+
+        Supported specs:
+        - "all": all layers
+        - "none": no layers
+        - Comma-separated indices/ranges, e.g. "4-9,11"
+        """
+        spec = str(config.pred_sub_layers).strip().lower()
+        if spec in {"all", "*"}:
+            layers = set(range(config.n_layer))
+        elif spec in {"none", "off", ""}:
+            layers = set()
+        else:
+            layers = set()
+            for part in spec.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    lo_s, hi_s = part.split("-", 1)
+                    lo, hi = int(lo_s), int(hi_s)
+                    assert lo <= hi, f"Invalid pred_sub_layers range '{part}': start must be <= end"
+                    for idx in range(lo, hi + 1):
+                        assert 0 <= idx < config.n_layer, f"pred_sub_layers index {idx} out of bounds for n_layer={config.n_layer}"
+                        layers.add(idx)
+                else:
+                    idx = int(part)
+                    assert 0 <= idx < config.n_layer, f"pred_sub_layers index {idx} out of bounds for n_layer={config.n_layer}"
+                    layers.add(idx)
+
+        if config.pred_sub_skip_full_layers:
+            # Full-context layers have long-window attention (left context >= sequence length).
+            layers = {i for i in layers if self.window_sizes[i][0] < config.sequence_len}
+        return layers
 
     def get_device(self):
         return self.transformer.wte.weight.device
@@ -505,10 +618,15 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        dino_pair = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            capture_dino = self.dino_enabled and targets is not None and kv_cache is None and i == self.dino_layer
+            if capture_dino:
+                x, dino_pair = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=True)
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=False)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -522,10 +640,32 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if self.dino_enabled and loss_reduction == "mean" and dino_pair is not None:
+                dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"])
+                loss = loss + self.config.dino_weight * dino_loss
             return loss
         else:
             # inference: just return the logits directly
             return logits
+
+    def _compute_dino_aux_loss(self, student, teacher):
+        """
+        DINO-style temporal distillation loss:
+        student(t) predicts stop-grad teacher(t + delta).
+        """
+        delta = int(self.config.dino_delta)
+        assert delta > 0, "dino_delta must be > 0"
+        if student.size(1) <= delta:
+            return student.new_zeros(())
+        student = student[:, :-delta, :]
+        teacher = teacher[:, delta:, :].detach()
+        student = F.normalize(student.float(), dim=-1)
+        teacher = F.normalize(teacher.float(), dim=-1)
+        s_logits = student / max(float(self.config.dino_student_temp), 1e-6)
+        t_logits = teacher / max(float(self.config.dino_teacher_temp), 1e-6)
+        t_probs = F.softmax(t_logits, dim=-1)
+        s_log_probs = F.log_softmax(s_logits, dim=-1)
+        return -(t_probs * s_log_probs).sum(dim=-1).mean()
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

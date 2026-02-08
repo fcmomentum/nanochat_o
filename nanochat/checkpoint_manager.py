@@ -29,6 +29,30 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "n_global_head" not in model_config_kwargs:
         model_config_kwargs["n_global_head"] = 0
         log0("Patching missing n_global_head in model config to 0")
+    if "pred_sub_layers" not in model_config_kwargs:
+        model_config_kwargs["pred_sub_layers"] = "all"
+        log0("Patching missing pred_sub_layers in model config to 'all'")
+    if "pred_sub_skip_full_layers" not in model_config_kwargs:
+        model_config_kwargs["pred_sub_skip_full_layers"] = False
+        log0("Patching missing pred_sub_skip_full_layers in model config to False")
+    if "dino_layer" not in model_config_kwargs:
+        model_config_kwargs["dino_layer"] = -1
+        log0("Patching missing dino_layer in model config to -1")
+    if "dino_delta" not in model_config_kwargs:
+        model_config_kwargs["dino_delta"] = 1
+        log0("Patching missing dino_delta in model config to 1")
+    if "dino_weight" not in model_config_kwargs:
+        model_config_kwargs["dino_weight"] = 0.0
+        log0("Patching missing dino_weight in model config to 0.0")
+    if "dino_student_temp" not in model_config_kwargs:
+        model_config_kwargs["dino_student_temp"] = 0.1
+        log0("Patching missing dino_student_temp in model config to 0.1")
+    if "dino_teacher_temp" not in model_config_kwargs:
+        model_config_kwargs["dino_teacher_temp"] = 0.04
+        log0("Patching missing dino_teacher_temp in model config to 0.04")
+    if "dino_mask_ratio" not in model_config_kwargs:
+        model_config_kwargs["dino_mask_ratio"] = 0.0
+        log0("Patching missing dino_mask_ratio in model config to 0.0")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

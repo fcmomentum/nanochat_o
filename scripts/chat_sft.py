@@ -301,7 +301,16 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "n_global_head": model.config.n_global_head,
                     "window_pattern": model.config.window_pattern,
+                    "pred_sub_layers": model.config.pred_sub_layers,
+                    "pred_sub_skip_full_layers": model.config.pred_sub_skip_full_layers,
+                    "dino_layer": model.config.dino_layer,
+                    "dino_delta": model.config.dino_delta,
+                    "dino_weight": model.config.dino_weight,
+                    "dino_student_temp": model.config.dino_student_temp,
+                    "dino_teacher_temp": model.config.dino_teacher_temp,
+                    "dino_mask_ratio": model.config.dino_mask_ratio,
                 },
                 "user_config": user_config, # inputs to the training script
             }

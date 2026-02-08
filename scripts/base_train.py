@@ -52,6 +52,14 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--global-head-pct", type=float, default=25.0, help="percentage of attention heads to use as global (full context); remaining are local")
+parser.add_argument("--pred-sub-layers", type=str, default="all", help="predictive subtraction layer spec: all|none|comma-separated indices/ranges (e.g. '4-9,11')")
+parser.add_argument("--pred-sub-skip-full-layers", action="store_true", help="if set, auto-disable predictive subtraction on full-context (L) layers")
+parser.add_argument("--dino-layer", type=int, default=-1, help="0-based layer index for DINO auxiliary loss (-1 disables)")
+parser.add_argument("--dino-delta", type=int, default=1, help="temporal offset delta for DINO teacher features (t+delta)")
+parser.add_argument("--dino-weight", type=float, default=0.0, help="weight of DINO auxiliary loss (0 disables)")
+parser.add_argument("--dino-student-temp", type=float, default=0.1, help="DINO student temperature")
+parser.add_argument("--dino-teacher-temp", type=float, default=0.04, help="DINO teacher temperature")
+parser.add_argument("--dino-mask-ratio", type=float, default=0.0, help="mask ratio for DINO student local-head branch (0 disables masking)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -153,6 +161,14 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
         n_global_head=n_global_head,
         window_pattern=args.window_pattern,
+        pred_sub_layers=args.pred_sub_layers,
+        pred_sub_skip_full_layers=args.pred_sub_skip_full_layers,
+        dino_layer=args.dino_layer,
+        dino_delta=args.dino_delta,
+        dino_weight=args.dino_weight,
+        dino_student_temp=args.dino_student_temp,
+        dino_teacher_temp=args.dino_teacher_temp,
+        dino_mask_ratio=args.dino_mask_ratio,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
