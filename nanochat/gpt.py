@@ -603,7 +603,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_loss_breakdown=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -639,10 +639,18 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            dino_loss = None
+            loss = ce_loss
             if self.dino_enabled and loss_reduction == "mean" and dino_pair is not None:
                 dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"])
                 loss = loss + self.config.dino_weight * dino_loss
+            if return_loss_breakdown:
+                dino_detached = dino_loss.detach() if dino_loss is not None else ce_loss.detach().new_zeros(())
+                return loss, {
+                    "ce_loss": ce_loss.detach(),
+                    "dino_aux_loss": dino_detached,
+                }
             return loss
         else:
             # inference: just return the logits directly
