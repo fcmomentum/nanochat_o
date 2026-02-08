@@ -125,6 +125,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
         B, T, C = x.size()
+        dino_pair = None
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -232,7 +233,6 @@ class CausalSelfAttention(nn.Module):
                     B, T, self.n_head - self.n_global_head, self.head_dim
                 )
                 y_local = y_local - self.pred_sub_scale * y_pred_local
-            dino_pair = None
             if capture_dino:
                 local_for_dino = y_local
                 if self.training and self.dino_mask_ratio > 0.0:
@@ -264,7 +264,7 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         if capture_dino and self.n_global_head < self.n_head:
-            return y, dino_pair if "dino_pair" in locals() else None
+            return y, dino_pair
         return y
 
 
