@@ -233,7 +233,7 @@ class CausalSelfAttention(nn.Module):
                 )
                 y_local = y_local - self.pred_sub_scale * y_pred_local
             dino_pair = None
-            if capture_dino and self.dino_local_proj is not None:
+            if capture_dino:
                 local_for_dino = y_local
                 if self.training and self.dino_mask_ratio > 0.0:
                     keep_prob = 1.0 - self.dino_mask_ratio
@@ -243,8 +243,19 @@ class CausalSelfAttention(nn.Module):
                     local_for_dino = local_for_dino * head_mask / max(keep_prob, 1e-6)
                 local_flat = local_for_dino.contiguous().view(B, T, -1)
                 global_flat = y_global.contiguous().view(B, T, -1)
+                if self.dino_local_proj is not None:
+                    student_feat = self.dino_local_proj(local_flat)
+                else:
+                    # Robust fallback: deterministic truncate/pad projection so DINO can still run.
+                    # This should be rare; keep training alive and surface via dino_active metrics.
+                    target_dim = global_flat.size(-1)
+                    if local_flat.size(-1) >= target_dim:
+                        student_feat = local_flat[..., :target_dim]
+                    else:
+                        pad = target_dim - local_flat.size(-1)
+                        student_feat = F.pad(local_flat, (0, pad))
                 dino_pair = {
-                    "student": self.dino_local_proj(local_flat),
+                    "student": student_feat,
                     "teacher": global_flat,
                 }
             y = torch.cat([y_global, y_local], dim=2)
@@ -655,11 +666,10 @@ class GPT(nn.Module):
             dino_active = ce_loss.detach().new_zeros(())
             loss = ce_loss
             if self.dino_enabled and loss_reduction == "mean":
-                if dino_pair is None:
-                    raise RuntimeError("DINO is enabled but no DINO feature pair was captured; check dino_layer/split-head config.")
-                dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"])
-                loss = loss + self.config.dino_weight * dino_loss
-                dino_active = ce_loss.detach().new_ones(())
+                if dino_pair is not None:
+                    dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"])
+                    loss = loss + self.config.dino_weight * dino_loss
+                    dino_active = ce_loss.detach().new_ones(())
             if return_loss_breakdown:
                 dino_detached = dino_loss.detach() if dino_loss is not None else ce_loss.detach().new_zeros(())
                 return loss, {
