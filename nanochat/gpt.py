@@ -641,15 +641,20 @@ class GPT(nn.Module):
             # TODO experiment with chunked cross-entropy?
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             dino_loss = None
+            dino_active = ce_loss.detach().new_zeros(())
             loss = ce_loss
-            if self.dino_enabled and loss_reduction == "mean" and dino_pair is not None:
+            if self.dino_enabled and loss_reduction == "mean":
+                if dino_pair is None:
+                    raise RuntimeError("DINO is enabled but no DINO feature pair was captured; check dino_layer/split-head config.")
                 dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"])
                 loss = loss + self.config.dino_weight * dino_loss
+                dino_active = ce_loss.detach().new_ones(())
             if return_loss_breakdown:
                 dino_detached = dino_loss.detach() if dino_loss is not None else ce_loss.detach().new_zeros(())
                 return loss, {
                     "ce_loss": ce_loss.detach(),
                     "dino_aux_loss": dino_detached,
+                    "dino_active": dino_active,
                 }
             return loss
         else:
