@@ -109,12 +109,19 @@ class CausalSelfAttention(nn.Module):
             # Learnable scale for predictive subtraction (init small for stability).
             self.pred_sub_scale = nn.Parameter(torch.tensor(0.1))
         if enable_dino and 0 < self.n_global_head < self.n_head:
-            n_local_head = self.n_head - self.n_global_head
-            self.dino_local_proj = nn.Linear(
-                n_local_head * self.head_dim,
-                self.n_global_head * self.head_dim,
-                bias=False,
-            )
+            self._ensure_dino_local_proj()
+
+    def _ensure_dino_local_proj(self):
+        if self.dino_local_proj is not None:
+            return
+        if not (0 < self.n_global_head < self.n_head):
+            return
+        n_local_head = self.n_head - self.n_global_head
+        self.dino_local_proj = nn.Linear(
+            n_local_head * self.head_dim,
+            self.n_global_head * self.head_dim,
+            bias=False,
+        )
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
         B, T, C = x.size()
@@ -333,6 +340,10 @@ class GPT(nn.Module):
                 for layer_idx in range(config.n_layer)
             ]),
         })
+        if self.dino_enabled:
+            dino_attn = self.transformer.h[self.dino_layer].attn
+            dino_attn._ensure_dino_local_proj()
+            assert dino_attn.dino_local_proj is not None, "Failed to initialize DINO local projection"
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
