@@ -54,6 +54,10 @@ class GPTConfig:
     dino_student_temp: float = 0.1
     dino_teacher_temp: float = 0.04
     dino_mask_ratio: float = 0.0
+    # If True, fuse masked DINO local features back into the main local stream.
+    dino_fuse_main: bool = False
+    # Initial scalar gate value for DINO fusion branch.
+    dino_fuse_init: float = 0.0
 
 
 def norm(x):
@@ -99,6 +103,9 @@ class CausalSelfAttention(nn.Module):
         self.dino_local_proj = None
         self.dino_teacher_dim = self.n_global_head * self.head_dim
         self.dino_mask_ratio = float(config.dino_mask_ratio)
+        self.dino_fuse_main = bool(config.dino_fuse_main)
+        self.dino_fuse_proj = None
+        self.dino_fuse_gate = None
         if enable_pred_sub and 0 < self.n_global_head < self.n_head:
             n_local_head = self.n_head - self.n_global_head
             self.pred_sub_proj = nn.Linear(
@@ -110,6 +117,11 @@ class CausalSelfAttention(nn.Module):
             self.pred_sub_scale = nn.Parameter(torch.tensor(0.1))
         if enable_dino and 0 < self.n_global_head < self.n_head:
             self._ensure_dino_local_proj()
+            if self.dino_fuse_main:
+                n_local_head = self.n_head - self.n_global_head
+                local_dim = n_local_head * self.head_dim
+                self.dino_fuse_proj = nn.Linear(local_dim, local_dim, bias=False)
+                self.dino_fuse_gate = nn.Parameter(torch.tensor(float(config.dino_fuse_init)))
 
     def _ensure_dino_local_proj(self):
         if self.dino_local_proj is not None:
@@ -242,6 +254,10 @@ class CausalSelfAttention(nn.Module):
                     head_mask = (torch.rand(B, T, n_local_head, 1, device=y_local.device) < keep_prob).to(y_local.dtype)
                     local_for_dino = local_for_dino * head_mask / max(keep_prob, 1e-6)
                 local_flat = local_for_dino.contiguous().view(B, T, -1)
+                if self.dino_fuse_proj is not None and self.dino_fuse_gate is not None:
+                    # Gated residual from masked DINO branch into the main local stream.
+                    fused = self.dino_fuse_proj(local_flat).view(B, T, self.n_head - self.n_global_head, self.head_dim)
+                    y_local = y_local + torch.sigmoid(self.dino_fuse_gate) * fused
                 global_flat = y_global.contiguous().view(B, T, -1)
                 if self.dino_local_proj is not None:
                     student_feat = self.dino_local_proj(local_flat)
@@ -328,9 +344,11 @@ class GPT(nn.Module):
             )
             assert config.dino_delta > 0, "dino_delta must be > 0"
             assert 0.0 <= config.dino_mask_ratio < 1.0, "dino_mask_ratio must be in [0, 1)"
+            assert 0.0 <= config.dino_fuse_init <= 1.0, "dino_fuse_init must be in [0, 1]"
             print0(
                 f"DINO aux enabled at layer {self.dino_layer} "
-                f"(delta={config.dino_delta}, weight={config.dino_weight}, mask={config.dino_mask_ratio})"
+                f"(delta={config.dino_delta}, weight={config.dino_weight}, mask={config.dino_mask_ratio}, "
+                f"fuse={config.dino_fuse_main})"
             )
         else:
             print0("DINO aux disabled")

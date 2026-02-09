@@ -311,6 +311,8 @@ while True:
                     "dino_student_temp": model.config.dino_student_temp,
                     "dino_teacher_temp": model.config.dino_teacher_temp,
                     "dino_mask_ratio": model.config.dino_mask_ratio,
+                    "dino_fuse_main": model.config.dino_fuse_main,
+                    "dino_fuse_init": model.config.dino_fuse_init,
                 },
                 "user_config": user_config, # inputs to the training script
             }

@@ -62,6 +62,8 @@ parser.add_argument("--dino-weight-warmup-ratio", type=float, default=0.0, help=
 parser.add_argument("--dino-student-temp", type=float, default=0.1, help="DINO student temperature")
 parser.add_argument("--dino-teacher-temp", type=float, default=0.04, help="DINO teacher temperature")
 parser.add_argument("--dino-mask-ratio", type=float, default=0.0, help="mask ratio for DINO student local-head branch (0 disables masking)")
+parser.add_argument("--dino-fuse-main", action="store_true", help="fuse masked DINO branch back into main local stream with a learned gate")
+parser.add_argument("--dino-fuse-init", type=float, default=0.0, help="initial gate value for DINO fusion branch (before sigmoid)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -171,6 +173,8 @@ def build_model_meta(depth):
         dino_student_temp=args.dino_student_temp,
         dino_teacher_temp=args.dino_teacher_temp,
         dino_mask_ratio=args.dino_mask_ratio,
+        dino_fuse_main=args.dino_fuse_main,
+        dino_fuse_init=args.dino_fuse_init,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
