@@ -375,6 +375,8 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # Runtime DINO weight can be updated during training (e.g., warmup) without recompiling.
+        self.register_buffer("dino_weight_buffer", torch.tensor(float(config.dino_weight)), persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -424,6 +426,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+        self.dino_weight_buffer.fill_(float(self.config.dino_weight))
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
@@ -668,7 +671,7 @@ class GPT(nn.Module):
             if self.dino_enabled and loss_reduction == "mean":
                 if dino_pair is not None:
                     dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"], targets)
-                    loss = loss + self.config.dino_weight * dino_loss
+                    loss = loss + self.dino_weight_buffer * dino_loss
                     dino_active = ce_loss.detach().new_ones(())
             if return_loss_breakdown:
                 dino_detached = dino_loss.detach() if dino_loss is not None else ce_loss.detach().new_zeros(())
@@ -676,6 +679,7 @@ class GPT(nn.Module):
                     "ce_loss": ce_loss.detach(),
                     "dino_aux_loss": dino_detached,
                     "dino_active": dino_active,
+                    "dino_weight": self.dino_weight_buffer.detach(),
                 }
             return loss
         else:

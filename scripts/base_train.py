@@ -58,6 +58,7 @@ parser.add_argument("--pred-sub-skip-full-layers", action="store_true", help="if
 parser.add_argument("--dino-layer", type=int, default=-1, help="0-based layer index for DINO auxiliary loss (-1 disables)")
 parser.add_argument("--dino-delta", type=int, default=1, help="temporal offset delta for DINO teacher features (t+delta)")
 parser.add_argument("--dino-weight", type=float, default=0.0, help="weight of DINO auxiliary loss (0 disables)")
+parser.add_argument("--dino-weight-warmup-ratio", type=float, default=0.0, help="fraction of total training steps to linearly warm up dino_weight from 0 to target")
 parser.add_argument("--dino-student-temp", type=float, default=0.1, help="DINO student temperature")
 parser.add_argument("--dino-teacher-temp", type=float, default=0.04, help="DINO teacher temperature")
 parser.add_argument("--dino-mask-ratio", type=float, default=0.0, help="mask ratio for DINO student local-head branch (0 disables masking)")
@@ -399,6 +400,15 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
+
+def get_dino_weight(it):
+    if args.dino_weight <= 0:
+        return 0.0
+    warmup_iters = round(args.dino_weight_warmup_ratio * num_iterations)
+    if warmup_iters <= 0:
+        return args.dino_weight
+    return args.dino_weight * min((it + 1) / warmup_iters, 1.0)
+
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
 
@@ -514,6 +524,10 @@ while True:
     dino_aux_loss_f = 0.0
     ce_loss_f = 0.0
     dino_active_f = 0.0
+    dino_weight_f = 0.0
+    dino_weight_cur = get_dino_weight(step)
+    if hasattr(orig_model, "dino_weight_buffer"):
+        orig_model.dino_weight_buffer.fill_(dino_weight_cur)
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss, loss_breakdown = model(x, y, return_loss_breakdown=True)
@@ -521,6 +535,7 @@ while True:
         ce_loss_f += loss_breakdown["ce_loss"].detach().item()
         dino_aux_loss_f += loss_breakdown["dino_aux_loss"].detach().item()
         dino_active_f += loss_breakdown["dino_active"].detach().item()
+        dino_weight_f += loss_breakdown["dino_weight"].detach().item()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -538,6 +553,7 @@ while True:
     ce_loss_f /= grad_accum_steps
     dino_aux_loss_f /= grad_accum_steps
     dino_active_f /= grad_accum_steps
+    dino_weight_f /= grad_accum_steps
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -574,7 +590,8 @@ while True:
             "train/ce_loss": ce_loss_f,
             "train/dino_aux_loss": dino_aux_loss_f,
             "train/dino_active": dino_active_f,
-            "train/dino_weighted_loss": dino_aux_loss_f * args.dino_weight,
+            "train/dino_weight": dino_weight_f,
+            "train/dino_weighted_loss": dino_aux_loss_f * dino_weight_f,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
