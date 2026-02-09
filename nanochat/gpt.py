@@ -431,6 +431,18 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn.pred_sub_proj is not None:
+                torch.nn.init.uniform_(block.attn.pred_sub_proj.weight, -s, s)
+            if block.attn.pred_sub_scale is not None:
+                block.attn.pred_sub_scale.fill_(0.1)
+            if block.attn.dino_bottleneck_proj is not None:
+                torch.nn.init.uniform_(block.attn.dino_bottleneck_proj.weight, -s, s)
+            if block.attn.dino_local_proj is not None:
+                torch.nn.init.uniform_(block.attn.dino_local_proj.weight, -s, s)
+            if block.attn.dino_fuse_proj is not None:
+                torch.nn.init.zeros_(block.attn.dino_fuse_proj.weight)  # neutral residual at init
+            if block.attn.dino_fuse_gate is not None:
+                block.attn.dino_fuse_gate.fill_(float(self.config.dino_fuse_init))
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
