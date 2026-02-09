@@ -667,7 +667,7 @@ class GPT(nn.Module):
             loss = ce_loss
             if self.dino_enabled and loss_reduction == "mean":
                 if dino_pair is not None:
-                    dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"])
+                    dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"], targets)
                     loss = loss + self.config.dino_weight * dino_loss
                     dino_active = ce_loss.detach().new_ones(())
             if return_loss_breakdown:
@@ -682,7 +682,7 @@ class GPT(nn.Module):
             # inference: just return the logits directly
             return logits
 
-    def _compute_dino_aux_loss(self, student, teacher):
+    def _compute_dino_aux_loss(self, student, teacher, targets=None):
         """
         DINO-style temporal distillation loss:
         student(t) predicts stop-grad teacher(t + delta).
@@ -699,7 +699,16 @@ class GPT(nn.Module):
         t_logits = teacher / max(float(self.config.dino_teacher_temp), 1e-6)
         t_probs = F.softmax(t_logits, dim=-1)
         s_log_probs = F.log_softmax(s_logits, dim=-1)
-        return -(t_probs * s_log_probs).sum(dim=-1).mean()
+        token_loss = -(t_probs * s_log_probs).sum(dim=-1)  # (B, T-delta)
+        if targets is not None:
+            # Respect training mask: exclude positions after end-of-sample (targets == -1).
+            # Require both source t and teacher target t+delta to be valid.
+            valid = (targets >= 0)
+            valid = valid[:, :-delta] & valid[:, delta:]
+            if not valid.any():
+                return student.new_zeros(())
+            token_loss = token_loss.masked_select(valid)
+        return token_loss.mean()
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
