@@ -59,6 +59,9 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "dino_fuse_init" not in model_config_kwargs:
         model_config_kwargs["dino_fuse_init"] = 0.0
         log0("Patching missing dino_fuse_init in model config to 0.0")
+    if "dino_bottleneck_dim" not in model_config_kwargs:
+        model_config_kwargs["dino_bottleneck_dim"] = 0
+        log0("Patching missing dino_bottleneck_dim in model config to 0")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

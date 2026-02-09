@@ -313,6 +313,7 @@ while True:
                     "dino_mask_ratio": model.config.dino_mask_ratio,
                     "dino_fuse_main": model.config.dino_fuse_main,
                     "dino_fuse_init": model.config.dino_fuse_init,
+                    "dino_bottleneck_dim": model.config.dino_bottleneck_dim,
                 },
                 "user_config": user_config, # inputs to the training script
             }

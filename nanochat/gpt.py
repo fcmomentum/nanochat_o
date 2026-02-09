@@ -58,6 +58,8 @@ class GPTConfig:
     dino_fuse_main: bool = False
     # Initial scalar gate value for DINO fusion branch.
     dino_fuse_init: float = 0.0
+    # Optional student bottleneck width before projecting to teacher space (0 disables).
+    dino_bottleneck_dim: int = 0
 
 
 def norm(x):
@@ -106,6 +108,7 @@ class CausalSelfAttention(nn.Module):
         self.dino_fuse_main = bool(config.dino_fuse_main)
         self.dino_fuse_proj = None
         self.dino_fuse_gate = None
+        self.dino_bottleneck_proj = None
         if enable_pred_sub and 0 < self.n_global_head < self.n_head:
             n_local_head = self.n_head - self.n_global_head
             self.pred_sub_proj = nn.Linear(
@@ -116,10 +119,12 @@ class CausalSelfAttention(nn.Module):
             # Learnable scale for predictive subtraction (init small for stability).
             self.pred_sub_scale = nn.Parameter(torch.tensor(0.1))
         if enable_dino and 0 < self.n_global_head < self.n_head:
+            n_local_head = self.n_head - self.n_global_head
+            local_dim = n_local_head * self.head_dim
+            if int(config.dino_bottleneck_dim) > 0:
+                self.dino_bottleneck_proj = nn.Linear(local_dim, int(config.dino_bottleneck_dim), bias=False)
             self._ensure_dino_local_proj()
             if self.dino_fuse_main:
-                n_local_head = self.n_head - self.n_global_head
-                local_dim = n_local_head * self.head_dim
                 self.dino_fuse_proj = nn.Linear(local_dim, local_dim, bias=False)
                 self.dino_fuse_gate = nn.Parameter(torch.tensor(float(config.dino_fuse_init)))
 
@@ -129,11 +134,9 @@ class CausalSelfAttention(nn.Module):
         if not (0 < self.n_global_head < self.n_head):
             return
         n_local_head = self.n_head - self.n_global_head
-        self.dino_local_proj = nn.Linear(
-            n_local_head * self.head_dim,
-            self.n_global_head * self.head_dim,
-            bias=False,
-        )
+        local_dim = n_local_head * self.head_dim
+        in_dim = self.dino_bottleneck_proj.out_features if self.dino_bottleneck_proj is not None else local_dim
+        self.dino_local_proj = nn.Linear(in_dim, self.n_global_head * self.head_dim, bias=False)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
         B, T, C = x.size()
@@ -259,17 +262,20 @@ class CausalSelfAttention(nn.Module):
                     fused = self.dino_fuse_proj(local_flat).view(B, T, self.n_head - self.n_global_head, self.head_dim)
                     y_local = y_local + torch.sigmoid(self.dino_fuse_gate) * fused
                 global_flat = y_global.contiguous().view(B, T, -1)
+                local_for_student = local_flat
+                if self.dino_bottleneck_proj is not None:
+                    local_for_student = self.dino_bottleneck_proj(local_for_student)
                 if self.dino_local_proj is not None:
-                    student_feat = self.dino_local_proj(local_flat)
+                    student_feat = self.dino_local_proj(local_for_student)
                 else:
                     # Robust fallback: deterministic truncate/pad projection so DINO can still run.
                     # This should be rare; keep training alive and surface via dino_active metrics.
                     target_dim = global_flat.size(-1)
-                    if local_flat.size(-1) >= target_dim:
-                        student_feat = local_flat[..., :target_dim]
+                    if local_for_student.size(-1) >= target_dim:
+                        student_feat = local_for_student[..., :target_dim]
                     else:
-                        pad = target_dim - local_flat.size(-1)
-                        student_feat = F.pad(local_flat, (0, pad))
+                        pad = target_dim - local_for_student.size(-1)
+                        student_feat = F.pad(local_for_student, (0, pad))
                 dino_pair = {
                     "student": student_feat,
                     "teacher": global_flat,
@@ -345,10 +351,11 @@ class GPT(nn.Module):
             assert config.dino_delta > 0, "dino_delta must be > 0"
             assert 0.0 <= config.dino_mask_ratio < 1.0, "dino_mask_ratio must be in [0, 1)"
             assert 0.0 <= config.dino_fuse_init <= 1.0, "dino_fuse_init must be in [0, 1]"
+            assert int(config.dino_bottleneck_dim) >= 0, "dino_bottleneck_dim must be >= 0"
             print0(
                 f"DINO aux enabled at layer {self.dino_layer} "
                 f"(delta={config.dino_delta}, weight={config.dino_weight}, mask={config.dino_mask_ratio}, "
-                f"fuse={config.dino_fuse_main})"
+                f"fuse={config.dino_fuse_main}, bottleneck={config.dino_bottleneck_dim})"
             )
         else:
             print0("DINO aux disabled")
