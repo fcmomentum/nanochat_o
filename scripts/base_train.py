@@ -536,6 +536,9 @@ while True:
     pred_sub_error_active_f = 0.0
     dino_weight_f = 0.0
     pred_sub_error_weight_f = 0.0
+    pred_sub_gate_mean_f = 0.0
+    pred_sub_gate_low_frac_f = 0.0
+    pred_sub_gate_high_frac_f = 0.0
     dino_weight_cur = get_dino_weight(step)
     if hasattr(orig_model, "dino_weight_buffer"):
         orig_model.dino_weight_buffer.fill_(dino_weight_cur)
@@ -550,6 +553,9 @@ while True:
         pred_sub_error_loss_f += loss_breakdown["pred_sub_error_loss"].detach().item()
         pred_sub_error_active_f += loss_breakdown["pred_sub_error_active"].detach().item()
         pred_sub_error_weight_f += loss_breakdown["pred_sub_error_weight"].detach().item()
+        pred_sub_gate_mean_f += loss_breakdown["pred_sub_gate_mean"].detach().item()
+        pred_sub_gate_low_frac_f += loss_breakdown["pred_sub_gate_low_frac"].detach().item()
+        pred_sub_gate_high_frac_f += loss_breakdown["pred_sub_gate_high_frac"].detach().item()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -571,6 +577,9 @@ while True:
     pred_sub_error_loss_f /= grad_accum_steps
     pred_sub_error_active_f /= grad_accum_steps
     pred_sub_error_weight_f /= grad_accum_steps
+    pred_sub_gate_mean_f /= grad_accum_steps
+    pred_sub_gate_low_frac_f /= grad_accum_steps
+    pred_sub_gate_high_frac_f /= grad_accum_steps
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -613,6 +622,9 @@ while True:
                 "train/pred_sub_error_active": pred_sub_error_active_f,
                 "train/pred_sub_error_weight": pred_sub_error_weight_f,
                 "train/pred_sub_error_weighted_loss": pred_sub_error_loss_f * pred_sub_error_weight_f,
+                "train/pred_sub_gate_mean": pred_sub_gate_mean_f,
+                "train/pred_sub_gate_low_frac": pred_sub_gate_low_frac_f,
+                "train/pred_sub_gate_high_frac": pred_sub_gate_high_frac_f,
                 "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,

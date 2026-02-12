@@ -148,6 +148,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
         dino_pair = None
         pred_sub_error_loss = None
+        pred_sub_gate_mean = None
+        pred_sub_gate_low_frac = None
+        pred_sub_gate_high_frac = None
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -260,6 +263,11 @@ class CausalSelfAttention(nn.Module):
                 if capture_pred_sub_error:
                     pred_sub_error_loss = error_local.float().pow(2).mean()
                 gate = torch.sigmoid(self.pred_sub_gate(error_local.contiguous().view(B, T, -1))).unsqueeze(-1)
+                if capture_pred_sub_error:
+                    gate_f = gate.float()
+                    pred_sub_gate_mean = gate_f.mean()
+                    pred_sub_gate_low_frac = (gate_f < 0.1).float().mean()
+                    pred_sub_gate_high_frac = (gate_f > 0.9).float().mean()
                 y_local = y_local - self.pred_sub_scale * gate * error_local
             if capture_dino:
                 local_for_dino = y_local
@@ -300,10 +308,20 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         if capture_dino and self.n_global_head < self.n_head:
             if capture_pred_sub_error:
-                return y, dino_pair, pred_sub_error_loss
+                return y, dino_pair, {
+                    "error_loss": pred_sub_error_loss,
+                    "gate_mean": pred_sub_gate_mean,
+                    "gate_low_frac": pred_sub_gate_low_frac,
+                    "gate_high_frac": pred_sub_gate_high_frac,
+                }
             return y, dino_pair
         if capture_pred_sub_error:
-            return y, pred_sub_error_loss
+            return y, {
+                "error_loss": pred_sub_error_loss,
+                "gate_mean": pred_sub_gate_mean,
+                "gate_low_frac": pred_sub_gate_low_frac,
+                "gate_high_frac": pred_sub_gate_high_frac,
+            }
         return y
 
 
@@ -337,21 +355,21 @@ class Block(nn.Module):
             capture_pred_sub_error=capture_pred_sub_error,
         )
         dino_pair = None
-        pred_sub_error_loss = None
+        pred_sub_metrics = None
         if capture_dino and capture_pred_sub_error:
-            attn_out, dino_pair, pred_sub_error_loss = attn_out
+            attn_out, dino_pair, pred_sub_metrics = attn_out
         elif capture_dino:
             attn_out, dino_pair = attn_out
         elif capture_pred_sub_error:
-            attn_out, pred_sub_error_loss = attn_out
+            attn_out, pred_sub_metrics = attn_out
         x = x + attn_out
         x = x + self.mlp(norm(x))
         if capture_dino and capture_pred_sub_error:
-            return x, dino_pair, pred_sub_error_loss
+            return x, dino_pair, pred_sub_metrics
         if capture_dino:
             return x, dino_pair
         if capture_pred_sub_error:
-            return x, pred_sub_error_loss
+            return x, pred_sub_metrics
         return x
 
 
@@ -725,6 +743,9 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         dino_pair = None
         pred_sub_error_losses = []
+        pred_sub_gate_means = []
+        pred_sub_gate_low_fracs = []
+        pred_sub_gate_high_fracs = []
         zero_ve = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -737,23 +758,38 @@ class GPT(nn.Module):
                     zero_ve = torch.zeros(B, T, kv_dim, dtype=x.dtype, device=x.device)
                 ve = zero_ve
             capture_dino = self.dino_enabled and targets is not None and kv_cache is None and i == self.dino_layer
-            capture_pred_sub_error = self.pred_sub_error_enabled and targets is not None and kv_cache is None
+            # Capture predictive-subtraction metrics during training even if aux weight is 0.
+            capture_pred_sub_error = bool(self.pred_sub_layers) and targets is not None and kv_cache is None
             if capture_dino and capture_pred_sub_error:
-                x, dino_pair, pred_sub_error_loss_i = block(
+                x, dino_pair, pred_sub_metrics_i = block(
                     x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=True, capture_pred_sub_error=True
                 )
-                if pred_sub_error_loss_i is not None:
-                    pred_sub_error_losses.append(pred_sub_error_loss_i)
+                if pred_sub_metrics_i is not None:
+                    if pred_sub_metrics_i["error_loss"] is not None:
+                        pred_sub_error_losses.append(pred_sub_metrics_i["error_loss"])
+                    if pred_sub_metrics_i["gate_mean"] is not None:
+                        pred_sub_gate_means.append(pred_sub_metrics_i["gate_mean"])
+                    if pred_sub_metrics_i["gate_low_frac"] is not None:
+                        pred_sub_gate_low_fracs.append(pred_sub_metrics_i["gate_low_frac"])
+                    if pred_sub_metrics_i["gate_high_frac"] is not None:
+                        pred_sub_gate_high_fracs.append(pred_sub_metrics_i["gate_high_frac"])
             elif capture_dino:
                 x, dino_pair = block(
                     x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=True, capture_pred_sub_error=False
                 )
             elif capture_pred_sub_error:
-                x, pred_sub_error_loss_i = block(
+                x, pred_sub_metrics_i = block(
                     x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=False, capture_pred_sub_error=True
                 )
-                if pred_sub_error_loss_i is not None:
-                    pred_sub_error_losses.append(pred_sub_error_loss_i)
+                if pred_sub_metrics_i is not None:
+                    if pred_sub_metrics_i["error_loss"] is not None:
+                        pred_sub_error_losses.append(pred_sub_metrics_i["error_loss"])
+                    if pred_sub_metrics_i["gate_mean"] is not None:
+                        pred_sub_gate_means.append(pred_sub_metrics_i["gate_mean"])
+                    if pred_sub_metrics_i["gate_low_frac"] is not None:
+                        pred_sub_gate_low_fracs.append(pred_sub_metrics_i["gate_low_frac"])
+                    if pred_sub_metrics_i["gate_high_frac"] is not None:
+                        pred_sub_gate_high_fracs.append(pred_sub_metrics_i["gate_high_frac"])
             else:
                 x = block(
                     x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=False, capture_pred_sub_error=False
@@ -789,6 +825,9 @@ class GPT(nn.Module):
             if return_loss_breakdown:
                 dino_detached = dino_loss.detach() if dino_loss is not None else ce_loss.detach().new_zeros(())
                 pred_sub_detached = pred_sub_error_loss.detach() if pred_sub_error_loss is not None else ce_loss.detach().new_zeros(())
+                pred_sub_gate_mean = torch.stack(pred_sub_gate_means).mean().detach() if pred_sub_gate_means else ce_loss.detach().new_zeros(())
+                pred_sub_gate_low = torch.stack(pred_sub_gate_low_fracs).mean().detach() if pred_sub_gate_low_fracs else ce_loss.detach().new_zeros(())
+                pred_sub_gate_high = torch.stack(pred_sub_gate_high_fracs).mean().detach() if pred_sub_gate_high_fracs else ce_loss.detach().new_zeros(())
                 return loss, {
                     "ce_loss": ce_loss.detach(),
                     "dino_aux_loss": dino_detached,
@@ -797,6 +836,9 @@ class GPT(nn.Module):
                     "pred_sub_error_loss": pred_sub_detached,
                     "pred_sub_error_active": pred_sub_error_active,
                     "pred_sub_error_weight": self.pred_sub_error_weight_buffer.detach(),
+                    "pred_sub_gate_mean": pred_sub_gate_mean,
+                    "pred_sub_gate_low_frac": pred_sub_gate_low,
+                    "pred_sub_gate_high_frac": pred_sub_gate_high,
                 }
             return loss
         else:
