@@ -55,6 +55,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--global-head-pct", type=float, default=25.0, help="percentage of attention heads to use as global (full context); remaining are local")
 parser.add_argument("--pred-sub-layers", type=str, default="all", help="predictive subtraction layer spec: all|none|comma-separated indices/ranges (e.g. '4-9,11')")
 parser.add_argument("--pred-sub-skip-full-layers", action="store_true", help="if set, auto-disable predictive subtraction on full-context (L) layers")
+parser.add_argument("--pred-sub-error-weight", type=float, default=0.0, help="auxiliary weight for minimizing predictive subtraction local error (0 disables)")
 parser.add_argument("--dino-layer", type=int, default=-1, help="0-based layer index for DINO auxiliary loss (-1 disables)")
 parser.add_argument("--dino-delta", type=int, default=1, help="temporal offset delta for DINO teacher features (t+delta)")
 parser.add_argument("--dino-weight", type=float, default=0.0, help="weight of DINO auxiliary loss (0 disables)")
@@ -168,6 +169,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         pred_sub_layers=args.pred_sub_layers,
         pred_sub_skip_full_layers=args.pred_sub_skip_full_layers,
+        pred_sub_error_weight=args.pred_sub_error_weight,
         dino_layer=args.dino_layer,
         dino_delta=args.dino_delta,
         dino_weight=args.dino_weight,
@@ -528,9 +530,12 @@ while True:
     synchronize()
     t0 = time.time()
     dino_aux_loss_f = 0.0
+    pred_sub_error_loss_f = 0.0
     ce_loss_f = 0.0
     dino_active_f = 0.0
+    pred_sub_error_active_f = 0.0
     dino_weight_f = 0.0
+    pred_sub_error_weight_f = 0.0
     dino_weight_cur = get_dino_weight(step)
     if hasattr(orig_model, "dino_weight_buffer"):
         orig_model.dino_weight_buffer.fill_(dino_weight_cur)
@@ -542,6 +547,9 @@ while True:
         dino_aux_loss_f += loss_breakdown["dino_aux_loss"].detach().item()
         dino_active_f += loss_breakdown["dino_active"].detach().item()
         dino_weight_f += loss_breakdown["dino_weight"].detach().item()
+        pred_sub_error_loss_f += loss_breakdown["pred_sub_error_loss"].detach().item()
+        pred_sub_error_active_f += loss_breakdown["pred_sub_error_active"].detach().item()
+        pred_sub_error_weight_f += loss_breakdown["pred_sub_error_weight"].detach().item()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -560,6 +568,9 @@ while True:
     dino_aux_loss_f /= grad_accum_steps
     dino_active_f /= grad_accum_steps
     dino_weight_f /= grad_accum_steps
+    pred_sub_error_loss_f /= grad_accum_steps
+    pred_sub_error_active_f /= grad_accum_steps
+    pred_sub_error_weight_f /= grad_accum_steps
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -594,11 +605,15 @@ while True:
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
             "train/ce_loss": ce_loss_f,
-            "train/dino_aux_loss": dino_aux_loss_f,
-            "train/dino_active": dino_active_f,
-            "train/dino_weight": dino_weight_f,
-            "train/dino_weighted_loss": dino_aux_loss_f * dino_weight_f,
-            "train/lrm": lrm,
+                "train/dino_aux_loss": dino_aux_loss_f,
+                "train/dino_active": dino_active_f,
+                "train/dino_weight": dino_weight_f,
+                "train/dino_weighted_loss": dino_aux_loss_f * dino_weight_f,
+                "train/pred_sub_error_loss": pred_sub_error_loss_f,
+                "train/pred_sub_error_active": pred_sub_error_active_f,
+                "train/pred_sub_error_weight": pred_sub_error_weight_f,
+                "train/pred_sub_error_weighted_loss": pred_sub_error_loss_f * pred_sub_error_weight_f,
+                "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,

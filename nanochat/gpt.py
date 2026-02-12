@@ -45,6 +45,8 @@ class GPTConfig:
     pred_sub_layers: str = "all"
     # If True, disable predictive subtraction on full-context (L) layers.
     pred_sub_skip_full_layers: bool = False
+    # Auxiliary loss weight for minimizing predictive subtraction local error.
+    pred_sub_error_weight: float = 0.0
     # Optional DINO-style auxiliary loss for split-head layers.
     # dino_layer: 0-based layer index, -1 disables.
     # dino_delta: predict teacher features at t + delta from student features at t.
@@ -102,6 +104,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         self.pred_sub_proj = None
         self.pred_sub_scale = None
+        self.pred_sub_gate = None
         self.dino_local_proj = None
         self.dino_teacher_dim = self.n_global_head * self.head_dim
         self.dino_mask_ratio = float(config.dino_mask_ratio)
@@ -111,11 +114,14 @@ class CausalSelfAttention(nn.Module):
         self.dino_bottleneck_proj = None
         if enable_pred_sub and 0 < self.n_global_head < self.n_head:
             n_local_head = self.n_head - self.n_global_head
+            local_dim = n_local_head * self.head_dim
             self.pred_sub_proj = nn.Linear(
                 self.n_global_head * self.head_dim,
-                n_local_head * self.head_dim,
+                local_dim,
                 bias=False,
             )
+            # Predictive gate: confidence for how much local prediction error to correct per local head.
+            self.pred_sub_gate = nn.Linear(local_dim, n_local_head, bias=False)
             # Learnable scale for predictive subtraction (init small for stability).
             self.pred_sub_scale = nn.Parameter(torch.tensor(0.1))
         if enable_dino and 0 < self.n_global_head < self.n_head:
@@ -138,9 +144,10 @@ class CausalSelfAttention(nn.Module):
         in_dim = self.dino_bottleneck_proj.out_features if self.dino_bottleneck_proj is not None else local_dim
         self.dino_local_proj = nn.Linear(in_dim, self.n_global_head * self.head_dim, bias=False)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False, capture_pred_sub_error=False):
         B, T, C = x.size()
         dino_pair = None
+        pred_sub_error_loss = None
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -242,12 +249,16 @@ class CausalSelfAttention(nn.Module):
                 if self.layer_idx == kv_cache.n_layers - 1:
                     kv_cache.advance(T)
             if self.pred_sub_proj is not None:
-                # Predict local features from global heads and subtract in head space.
+                # Predict local features from global heads, then apply gated error correction in head space.
                 y_global_flat = y_global.contiguous().view(B, T, -1)
                 y_pred_local = self.pred_sub_proj(y_global_flat).view(
                     B, T, self.n_head - self.n_global_head, self.head_dim
                 )
-                y_local = y_local - self.pred_sub_scale * y_pred_local
+                error_local = y_local - y_pred_local
+                if capture_pred_sub_error:
+                    pred_sub_error_loss = error_local.float().pow(2).mean()
+                gate = torch.sigmoid(self.pred_sub_gate(error_local.contiguous().view(B, T, -1))).unsqueeze(-1)
+                y_local = y_local - self.pred_sub_scale * gate * error_local
             if capture_dino:
                 local_for_dino = y_local
                 if self.training and self.dino_mask_ratio > 0.0:
@@ -286,7 +297,11 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         if capture_dino and self.n_global_head < self.n_head:
+            if capture_pred_sub_error:
+                return y, dino_pair, pred_sub_error_loss
             return y, dino_pair
+        if capture_pred_sub_error:
+            return y, pred_sub_error_loss
         return y
 
 
@@ -309,15 +324,32 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx, enable_pred_sub, enable_dino)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False):
-        attn_out = self.attn(norm(x), ve, cos_sin, window_size, kv_cache, capture_dino=capture_dino)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, capture_dino=False, capture_pred_sub_error=False):
+        attn_out = self.attn(
+            norm(x),
+            ve,
+            cos_sin,
+            window_size,
+            kv_cache,
+            capture_dino=capture_dino,
+            capture_pred_sub_error=capture_pred_sub_error,
+        )
         dino_pair = None
-        if capture_dino:
+        pred_sub_error_loss = None
+        if capture_dino and capture_pred_sub_error:
+            attn_out, dino_pair, pred_sub_error_loss = attn_out
+        elif capture_dino:
             attn_out, dino_pair = attn_out
+        elif capture_pred_sub_error:
+            attn_out, pred_sub_error_loss = attn_out
         x = x + attn_out
         x = x + self.mlp(norm(x))
+        if capture_dino and capture_pred_sub_error:
+            return x, dino_pair, pred_sub_error_loss
         if capture_dino:
             return x, dino_pair
+        if capture_pred_sub_error:
+            return x, pred_sub_error_loss
         return x
 
 
@@ -343,6 +375,7 @@ class GPT(nn.Module):
         print0(f"Predictive subtraction layers: {pred_sub_str}")
         self.dino_layer = int(config.dino_layer)
         self.dino_enabled = config.dino_weight > 0.0 and self.dino_layer >= 0
+        self.pred_sub_error_enabled = float(config.pred_sub_error_weight) > 0.0
         if self.dino_enabled:
             assert 0 <= self.dino_layer < config.n_layer, f"dino_layer out of bounds: {self.dino_layer}"
             assert 0 < config.n_global_head < config.n_head, (
@@ -359,6 +392,10 @@ class GPT(nn.Module):
             )
         else:
             print0("DINO aux disabled")
+        if self.pred_sub_error_enabled:
+            print0(f"Predictive subtraction error aux enabled (weight={config.pred_sub_error_weight})")
+        else:
+            print0("Predictive subtraction error aux disabled")
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -402,6 +439,7 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         # Runtime DINO weight can be updated during training (e.g., warmup) without recompiling.
         self.register_buffer("dino_weight_buffer", torch.tensor(float(config.dino_weight)), persistent=False)
+        self.register_buffer("pred_sub_error_weight_buffer", torch.tensor(float(config.pred_sub_error_weight)), persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -433,6 +471,8 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if block.attn.pred_sub_proj is not None:
                 torch.nn.init.uniform_(block.attn.pred_sub_proj.weight, -s, s)
+            if block.attn.pred_sub_gate is not None:
+                torch.nn.init.zeros_(block.attn.pred_sub_gate.weight)
             if block.attn.pred_sub_scale is not None:
                 block.attn.pred_sub_scale.fill_(0.1)
             if block.attn.dino_bottleneck_proj is not None:
@@ -464,6 +504,7 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         self.dino_weight_buffer.fill_(float(self.config.dino_weight))
+        self.pred_sub_error_weight_buffer.fill_(float(self.config.pred_sub_error_weight))
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
@@ -681,14 +722,32 @@ class GPT(nn.Module):
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         dino_pair = None
+        pred_sub_error_losses = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             capture_dino = self.dino_enabled and targets is not None and kv_cache is None and i == self.dino_layer
-            if capture_dino:
-                x, dino_pair = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=True)
+            capture_pred_sub_error = self.pred_sub_error_enabled and targets is not None and kv_cache is None
+            if capture_dino and capture_pred_sub_error:
+                x, dino_pair, pred_sub_error_loss_i = block(
+                    x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=True, capture_pred_sub_error=True
+                )
+                if pred_sub_error_loss_i is not None:
+                    pred_sub_error_losses.append(pred_sub_error_loss_i)
+            elif capture_dino:
+                x, dino_pair = block(
+                    x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=True, capture_pred_sub_error=False
+                )
+            elif capture_pred_sub_error:
+                x, pred_sub_error_loss_i = block(
+                    x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=False, capture_pred_sub_error=True
+                )
+                if pred_sub_error_loss_i is not None:
+                    pred_sub_error_losses.append(pred_sub_error_loss_i)
             else:
-                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=False)
+                x = block(
+                    x, ve, cos_sin, self.window_sizes[i], kv_cache, capture_dino=False, capture_pred_sub_error=False
+                )
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -703,20 +762,31 @@ class GPT(nn.Module):
             # TODO experiment with chunked cross-entropy?
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             dino_loss = None
+            pred_sub_error_loss = None
             dino_active = ce_loss.detach().new_zeros(())
+            pred_sub_error_active = ce_loss.detach().new_zeros(())
             loss = ce_loss
             if self.dino_enabled and loss_reduction == "mean":
                 if dino_pair is not None:
                     dino_loss = self._compute_dino_aux_loss(dino_pair["student"], dino_pair["teacher"], targets)
                     loss = loss + self.dino_weight_buffer * dino_loss
                     dino_active = ce_loss.detach().new_ones(())
+            if self.pred_sub_error_enabled and loss_reduction == "mean":
+                if pred_sub_error_losses:
+                    pred_sub_error_loss = torch.stack(pred_sub_error_losses).mean()
+                    loss = loss + self.pred_sub_error_weight_buffer * pred_sub_error_loss
+                    pred_sub_error_active = ce_loss.detach().new_ones(())
             if return_loss_breakdown:
                 dino_detached = dino_loss.detach() if dino_loss is not None else ce_loss.detach().new_zeros(())
+                pred_sub_detached = pred_sub_error_loss.detach() if pred_sub_error_loss is not None else ce_loss.detach().new_zeros(())
                 return loss, {
                     "ce_loss": ce_loss.detach(),
                     "dino_aux_loss": dino_detached,
                     "dino_active": dino_active,
                     "dino_weight": self.dino_weight_buffer.detach(),
+                    "pred_sub_error_loss": pred_sub_detached,
+                    "pred_sub_error_active": pred_sub_error_active,
+                    "pred_sub_error_weight": self.pred_sub_error_weight_buffer.detach(),
                 }
             return loss
         else:
