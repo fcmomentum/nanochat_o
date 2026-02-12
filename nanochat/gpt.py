@@ -155,8 +155,10 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head.
+        # Gate presence is static per layer, which helps torch.compile avoid None-based recompiles.
+        if self.ve_gate is not None:
+            assert ve is not None, "ve tensor is required when ve_gate is enabled"
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
@@ -723,9 +725,17 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         dino_pair = None
         pred_sub_error_losses = []
+        zero_ve = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            if str(i) in self.value_embeds:
+                ve = self.value_embeds[str(i)](idx)
+            else:
+                # Keep ve argument tensor-typed across layers to reduce torch.compile recompiles.
+                if zero_ve is None:
+                    kv_dim = self.config.n_kv_head * (self.config.n_embd // self.config.n_head)
+                    zero_ve = torch.zeros(B, T, kv_dim, dtype=x.dtype, device=x.device)
+                ve = zero_ve
             capture_dino = self.dino_enabled and targets is not None and kv_cache is None and i == self.dino_layer
             capture_pred_sub_error = self.pred_sub_error_enabled and targets is not None and kv_cache is None
             if capture_dino and capture_pred_sub_error:
