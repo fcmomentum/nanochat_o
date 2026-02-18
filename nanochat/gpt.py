@@ -494,13 +494,16 @@ class GPT(nn.Module):
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
         global_matrix_params = []
+        # Token gate weights have shape (1, 2C) — shape[0]=1 isn't divisible by
+        # world_size for reduce_scatter, so they go into a separate small-param group.
+        global_token_gate_params = []
         if self.global_enabled:
             global_matrix_params.extend(self.patch_encoder.parameters())
             global_matrix_params.extend(self.patch_transformer.parameters())
             global_matrix_params.extend(self.global_align_proj.parameters())
             global_matrix_params.extend(self.global_teacher_proj.parameters())
             global_matrix_params.extend(self.global_fuse_proj.parameters())
-            global_matrix_params.extend(self.global_fuse_token_gate.parameters())
+            global_token_gate_params.extend(self.global_fuse_token_gate.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -510,6 +513,7 @@ class GPT(nn.Module):
         assert len(list(self.parameters())) == (
             len(matrix_params)
             + len(global_matrix_params)
+            + len(global_token_gate_params)
             + len(embedding_params)
             + len(lm_head_params)
             + len(value_embeds_params)
@@ -533,6 +537,11 @@ class GPT(nn.Module):
         ]
         if global_matrix_params:
             param_groups.append(dict(kind='adamw', params=global_matrix_params, lr=global_matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        if global_token_gate_params:
+            # Separate group: shape (1, 2C) has shape[0]=1, not divisible by world_size for reduce_scatter.
+            # numel < 1024 check in DistMuonAdamW won't help since 2C > 1024, so we force small-param
+            # treatment by keeping them in their own group (the optimizer handles them individually).
+            param_groups.append(dict(kind='adamw', params=global_token_gate_params, lr=global_matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         if self.global_fuse_gates.numel() > 0:
             param_groups.append(dict(kind='adamw', params=global_gate_params, lr=global_gate_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
