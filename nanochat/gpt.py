@@ -505,7 +505,16 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         global_gate_params = [self.global_fuse_gates]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(global_gate_params)
+        assert len(list(self.parameters())) == (
+            len(matrix_params)
+            + len(global_matrix_params)
+            + len(embedding_params)
+            + len(lm_head_params)
+            + len(value_embeds_params)
+            + len(resid_params)
+            + len(x0_params)
+            + len(global_gate_params)
+        )
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
