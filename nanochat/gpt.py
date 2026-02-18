@@ -638,10 +638,11 @@ class GPT(nn.Module):
                 and loss_reduction == 'mean'
                 and global_next_tokens is not None
             ):
-                z_global = F.normalize(self.global_align_proj(norm(global_next_tokens)), dim=-1)
+                z_global = F.normalize(self.global_align_proj(norm(global_next_tokens)), dim=-1, eps=1e-6)
                 teacher_tokens = align_teacher_tokens if align_teacher_tokens is not None else x
-                z_teacher = F.normalize(self.global_teacher_proj(norm(teacher_tokens.detach())), dim=-1)
+                z_teacher = F.normalize(self.global_teacher_proj(norm(teacher_tokens.detach())), dim=-1, eps=1e-6)
                 align_dist = 1.0 - (z_global * z_teacher).sum(dim=-1)  # (B, T)
+                align_dist = torch.nan_to_num(align_dist, nan=0.0, posinf=2.0, neginf=0.0)
                 valid_mask = targets != -1
                 # patch 0 has no previous-patch global context by design
                 patch_ids = torch.arange(T, device=idx.device) // self.global_patch_size
@@ -656,6 +657,11 @@ class GPT(nn.Module):
                 gate_vals = torch.sigmoid(self.global_fuse_gates)
                 target = gate_vals.new_full(gate_vals.shape, global_gate_target)
                 loss_gate_target = (gate_vals - target).square().mean()
+            # Guard auxiliary terms against accidental NaN/Inf propagation.
+            loss_aux = torch.nan_to_num(loss_aux, nan=0.0, posinf=0.0, neginf=0.0)
+            loss_align = torch.nan_to_num(loss_align, nan=0.0, posinf=0.0, neginf=0.0)
+            loss_gate = torch.nan_to_num(loss_gate, nan=0.0, posinf=0.0, neginf=0.0)
+            loss_gate_target = torch.nan_to_num(loss_gate_target, nan=0.0, posinf=0.0, neginf=0.0)
             loss = (
                 loss_main
                 + global_aux_weight * loss_aux
