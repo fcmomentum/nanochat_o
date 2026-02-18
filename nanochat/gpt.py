@@ -480,6 +480,7 @@ class GPT(nn.Module):
         unembedding_lr=0.004,
         embedding_lr=0.2,
         matrix_lr=0.02,
+        global_matrix_lr=0.002,
         weight_decay=0.0,
         adam_betas=(0.8, 0.95),
         scalar_lr=0.5,
@@ -498,7 +499,6 @@ class GPT(nn.Module):
             global_matrix_params.extend(self.global_teacher_proj.parameters())
             global_matrix_params.extend(self.global_fuse_proj.parameters())
             global_matrix_params.extend(self.global_fuse_token_gate.parameters())
-        matrix_params = matrix_params + global_matrix_params
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -520,6 +520,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        if global_matrix_params:
+            param_groups.append(dict(kind='adamw', params=global_matrix_params, lr=global_matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         if self.global_fuse_gates.numel() > 0:
             param_groups.append(dict(kind='adamw', params=global_gate_params, lr=global_gate_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)

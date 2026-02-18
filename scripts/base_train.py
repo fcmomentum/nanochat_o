@@ -74,6 +74,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--global-matrix-lr", type=float, default=0.002, help="learning rate for global-branch matrices (AdamW)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--global-gate-lr", type=float, default=0.02, help="learning rate for global fusion gates")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
@@ -340,6 +341,7 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     matrix_lr=args.matrix_lr * batch_lr_scale,
+    global_matrix_lr=args.global_matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     adam_betas=adam_betas,
     scalar_lr=args.scalar_lr * batch_lr_scale,
