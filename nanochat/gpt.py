@@ -624,6 +624,7 @@ class GPT(nn.Module):
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=softcap, neginf=-softcap)
 
         if targets is not None:
             # training: given the targets, compute and return the loss

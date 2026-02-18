@@ -393,6 +393,7 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    nonfinite_steps = 0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -400,6 +401,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    nonfinite_steps = loop_state.get("nonfinite_steps", 0)
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -482,6 +484,7 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "nonfinite_steps": nonfinite_steps,
                 },
             },
             rank=ddp_rank,
@@ -498,6 +501,7 @@ while True:
     t0 = time.time()
     ablation_x = None
     ablation_y = None
+    nonfinite_this_step = False
     for micro_step in range(grad_accum_steps):
         ablation_x = x
         ablation_y = y
@@ -512,10 +516,25 @@ while True:
                 global_gate_target_weight=args.global_gate_target_weight,
                 return_global_stats=True,
             )
+        if not torch.isfinite(loss):
+            nonfinite_this_step = True
+            break
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    if nonfinite_this_step:
+        model.zero_grad(set_to_none=True)
+        nonfinite_steps += 1
+        epoch = dataloader_state_dict["epoch"]
+        print0(f"step {step:05d}/{num_iterations:05d} | non-finite loss detected, skipping optimizer step | epoch: {epoch}")
+        wandb_run.log({
+            "step": step,
+            "train/nonfinite_step": 1,
+            "train/nonfinite_steps_total": nonfinite_steps,
+        })
+        step += 1
+        continue
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -597,6 +616,8 @@ while True:
             "train/loss_global_align": train_loss_align_f,
             "train/loss_global_gate_reg": train_loss_gate_f,
             "train/loss_global_gate_target_reg": train_loss_gate_target_f,
+            "train/nonfinite_step": 0,
+            "train/nonfinite_steps_total": nonfinite_steps,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
