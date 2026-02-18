@@ -375,7 +375,7 @@ class GPT(nn.Module):
         gctx_norm = norm(global_ctx_tokens)
         # Detach global context in gate input to prevent gradient backflow through the gate
         token_gate_in = torch.cat([x_norm, gctx_norm.detach()], dim=-1)
-        token_gate = torch.sigmoid(self.global_fuse_token_gate[str(layer_idx)](token_gate_in) - 4.0)  # (B, T, 1) scalar gate, offset so init ≈ 0.018
+        token_gate = torch.sigmoid(self.global_fuse_token_gate[str(layer_idx)](token_gate_in))  # (B, T, 1) scalar gate; fuse_proj zero-init ensures zero fusion at init
         # Scale by number of fusion layers to prevent gradient fan-in
         n_fuse = len(self.global_fusion_layers)
         x = x + (scalar_gate * token_gate * self.global_fuse_proj[str(layer_idx)](gctx_norm)) / n_fuse
