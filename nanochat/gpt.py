@@ -619,7 +619,10 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if (self.global_enabled and kv_cache is None and i == self.global_start_layer):
                 # Patchify after this token layer, then run patch-level causal transformer.
-                global_ctx_tokens, global_next_tokens = self._build_global_context(x)
+                # Detach: the only gradient path from global→token stream should be through
+                # the gated fusion (zero-init'd), not through the aux/align losses which
+                # would create uncontrolled gradients back into the token transformer.
+                global_ctx_tokens, global_next_tokens = self._build_global_context(x.detach())
             if (
                 self.global_enabled
                 and kv_cache is None
