@@ -56,6 +56,17 @@ def _patch_missing_keys(model_data, model_config):
         model_data["global_align_proj.weight"] = torch.zeros(model_config.global_align_dim, model_config.n_embd)
     if model_config.global_patch_size > 0 and "global_teacher_proj.weight" not in model_data:
         model_data["global_teacher_proj.weight"] = torch.zeros(model_config.global_align_dim, model_config.n_embd)
+    if model_config.global_patch_size > 0:
+        global_start_layer = model_config.global_start_layer if model_config.global_start_layer >= 0 else max(model_config.n_layer // 3, 0)
+        global_end_layer = model_config.global_end_layer if model_config.global_end_layer >= 0 else min((2 * model_config.n_layer) // 3, model_config.n_layer - 1)
+        if global_end_layer < global_start_layer:
+            global_end_layer = global_start_layer
+        global_fusion_every = max(1, model_config.global_fusion_every)
+        for i in range(global_start_layer + 1, global_end_layer + 1):
+            if (i - global_start_layer) % global_fusion_every == 0:
+                key = f"global_fuse_token_gate.{i}.weight"
+                if key not in model_data:
+                    model_data[key] = torch.zeros(model_config.n_embd, 2 * model_config.n_embd)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:

@@ -224,11 +224,13 @@ class GPT(nn.Module):
             self.global_align_proj = nn.Linear(config.n_embd, config.global_align_dim, bias=False)
             self.global_teacher_proj = nn.Linear(config.n_embd, config.global_align_dim, bias=False)
             self.global_fuse_proj = nn.ModuleDict()
+            self.global_fuse_token_gate = nn.ModuleDict()
             gate_layers = []
             for i in range(self.global_start_layer + 1, self.global_end_layer + 1):
                 if (i - self.global_start_layer) % self.global_fusion_every == 0:
                     self.global_fusion_layers.append(i)
                     self.global_fuse_proj[str(i)] = nn.Linear(config.n_embd, config.n_embd, bias=False)
+                    self.global_fuse_token_gate[str(i)] = nn.Linear(2 * config.n_embd, config.n_embd, bias=False)
                     gate_layers.append(i)
             self.global_fusion_gate_idx = {layer: j for j, layer in enumerate(gate_layers)}
             self.global_fuse_gates = nn.Parameter(torch.zeros(len(gate_layers)))
@@ -238,6 +240,7 @@ class GPT(nn.Module):
             self.global_align_proj = None
             self.global_teacher_proj = None
             self.global_fuse_proj = nn.ModuleDict()
+            self.global_fuse_token_gate = nn.ModuleDict()
             self.global_fuse_gates = nn.Parameter(torch.zeros(0))
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -302,6 +305,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(self.global_teacher_proj.weight, -s, s)
             for proj in self.global_fuse_proj.values():
                 torch.nn.init.zeros_(proj.weight)
+            for gate in self.global_fuse_token_gate.values():
+                torch.nn.init.zeros_(gate.weight)
             self.global_fuse_gates.zero_()
 
         # Per-layer scalars
@@ -454,7 +459,8 @@ class GPT(nn.Module):
             sum(p.numel() for p in self.patch_transformer.parameters()) +
             self.global_align_proj.weight.numel() +
             self.global_teacher_proj.weight.numel() +
-            sum(p.weight.numel() for p in self.global_fuse_proj.values())
+            sum(p.weight.numel() for p in self.global_fuse_proj.values()) +
+            sum(p.weight.numel() for p in self.global_fuse_token_gate.values())
         )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.global_fuse_gates.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + global_matrices + scalars
@@ -491,6 +497,7 @@ class GPT(nn.Module):
             global_matrix_params.extend(self.global_align_proj.parameters())
             global_matrix_params.extend(self.global_teacher_proj.parameters())
             global_matrix_params.extend(self.global_fuse_proj.parameters())
+            global_matrix_params.extend(self.global_fuse_token_gate.parameters())
         matrix_params = matrix_params + global_matrix_params
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -561,6 +568,9 @@ class GPT(nn.Module):
         global_next_tokens = None
         align_teacher_tokens = None
         final_fusion_layer = self.global_fusion_layers[-1] if self.global_fusion_layers else None
+        token_gate_means = []
+        token_gate_mins = []
+        token_gate_maxs = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             if (
@@ -571,8 +581,15 @@ class GPT(nn.Module):
                 and i in self.global_fusion_layers
             ):
                 gate_idx = self.global_fusion_gate_idx[i]
-                gate = torch.sigmoid(self.global_fuse_gates[gate_idx])
-                x = x + gate * self.global_fuse_proj[str(i)](norm(global_ctx_tokens))
+                scalar_gate = torch.sigmoid(self.global_fuse_gates[gate_idx])
+                x_norm = norm(x)
+                gctx_norm = norm(global_ctx_tokens)
+                token_gate_in = torch.cat([x_norm, gctx_norm], dim=-1)
+                token_gate = torch.sigmoid(self.global_fuse_token_gate[str(i)](token_gate_in))
+                token_gate_means.append(token_gate.mean())
+                token_gate_mins.append(token_gate.min())
+                token_gate_maxs.append(token_gate.max())
+                x = x + scalar_gate * token_gate * self.global_fuse_proj[str(i)](gctx_norm)
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if (self.global_enabled and kv_cache is None and i == self.global_start_layer):
@@ -647,9 +664,9 @@ class GPT(nn.Module):
                 + global_gate_target_weight * loss_gate_target
             )
             if return_global_stats:
-                gate_mean = torch.sigmoid(self.global_fuse_gates).mean() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
-                gate_min = torch.sigmoid(self.global_fuse_gates).min() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
-                gate_max = torch.sigmoid(self.global_fuse_gates).max() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
+                gate_mean = torch.stack(token_gate_means).mean() if token_gate_means else logits.new_zeros(())
+                gate_min = torch.stack(token_gate_mins).min() if token_gate_mins else logits.new_zeros(())
+                gate_max = torch.stack(token_gate_maxs).max() if token_gate_maxs else logits.new_zeros(())
                 ctx_norm = global_ctx_tokens.norm(dim=-1).mean() if global_ctx_tokens is not None else logits.new_zeros(())
                 return (
                     loss,
