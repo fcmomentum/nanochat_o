@@ -51,6 +51,13 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--global-patch-size", type=int, default=-1, help="enable global patch stream with this patch size in tokens (-1 disables)")
+parser.add_argument("--global-start-layer", type=int, default=-1, help="first layer for global stream/fusion (-1 = auto)")
+parser.add_argument("--global-end-layer", type=int, default=-1, help="last layer for global stream/fusion (-1 = auto)")
+parser.add_argument("--global-fusion-every", type=int, default=2, help="fuse global context every N layers in [global_start_layer, global_end_layer]")
+parser.add_argument("--global-aux-weight", type=float, default=0.1, help="aux CE weight for predicting next patch tokens from global state")
+parser.add_argument("--global-gate-l1", type=float, default=0.0, help="L1 regularization weight on global fusion gates")
+parser.add_argument("--global-ablation-every", type=int, default=500, help="measure loss delta with global fusion disabled every N steps (-1 disables)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -133,6 +140,10 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        global_patch_size=args.global_patch_size,
+        global_start_layer=args.global_start_layer,
+        global_end_layer=args.global_end_layer,
+        global_fusion_every=args.global_fusion_every,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -251,7 +262,7 @@ num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Scaling params: transformer matrices + lm_head (gives cleanest scaling laws, see dev/LOG.md Jan 27, 2026)
-get_scaling_params = lambda m: m.num_scaling_params()['transformer_matrices'] + m.num_scaling_params()['lm_head']
+get_scaling_params = lambda m: m.num_scaling_params()['transformer_matrices'] + m.num_scaling_params()['global_matrices'] + m.num_scaling_params()['lm_head']
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params)
 
@@ -476,7 +487,13 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, train_loss_main, train_loss_aux, train_loss_gate, gate_mean, gate_min, gate_max, ctx_norm = model(
+                x,
+                y,
+                global_aux_weight=args.global_aux_weight,
+                global_gate_l1=args.global_gate_l1,
+                return_global_stats=True,
+            )
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -493,6 +510,33 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_loss_main_f = train_loss_main.item()
+    train_loss_aux_f = train_loss_aux.item()
+    train_loss_gate_f = train_loss_gate.item()
+    gate_mean_f = gate_mean.item()
+    gate_min_f = gate_min.item()
+    gate_max_f = gate_max.item()
+    ctx_norm_f = ctx_norm.item()
+    ablation_loss_delta_f = 0.0
+    ablation_loss_ratio_f = 1.0
+    should_run_ablation = (
+        args.global_patch_size > 0
+        and args.global_ablation_every > 0
+        and (step > 0 and step % args.global_ablation_every == 0)
+    )
+    if should_run_ablation:
+        with torch.no_grad(), autocast_ctx:
+            loss_no_global, _, _, _, _, _, _, _ = model(
+                x,
+                y,
+                global_aux_weight=args.global_aux_weight,
+                global_gate_l1=args.global_gate_l1,
+                disable_global_fusion=True,
+                return_global_stats=True,
+            )
+        loss_no_global_f = loss_no_global.item()
+        ablation_loss_delta_f = loss_no_global_f - train_loss_f
+        ablation_loss_ratio_f = loss_no_global_f / max(train_loss_f, 1e-8)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -525,11 +569,22 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/loss_main": train_loss_main_f,
+            "train/loss_global_aux": train_loss_aux_f,
+            "train/loss_global_gate_reg": train_loss_gate_f,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "global/gate_mean": gate_mean_f,
+            "global/gate_min": gate_min_f,
+            "global/gate_max": gate_max_f,
+            "global/context_norm": ctx_norm_f,
+            "global/aux_weight": args.global_aux_weight,
+            "global/patch_size": args.global_patch_size,
+            "global/ablation_loss_delta": ablation_loss_delta_f,
+            "global/ablation_loss_ratio": ablation_loss_ratio_f,
         }
         wandb_run.log(log_data)
 

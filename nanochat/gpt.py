@@ -37,6 +37,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Optional global patch stream (disabled when patch_size <= 0)
+    global_patch_size: int = -1
+    global_start_layer: int = -1
+    global_end_layer: int = -1
+    global_fusion_every: int = 2
 
 
 def norm(x):
@@ -165,6 +170,35 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Optional global patch stream modules
+        self.global_enabled = config.global_patch_size > 0
+        self.global_patch_size = config.global_patch_size
+        self.global_start_layer = config.global_start_layer if config.global_start_layer >= 0 else max(config.n_layer // 3, 0)
+        self.global_end_layer = config.global_end_layer if config.global_end_layer >= 0 else min((2 * config.n_layer) // 3, config.n_layer - 1)
+        if self.global_end_layer < self.global_start_layer:
+            self.global_end_layer = self.global_start_layer
+        self.global_fusion_every = max(1, config.global_fusion_every)
+        self.global_fusion_layers = []
+        self.global_fusion_gate_idx = {}
+        if self.global_enabled:
+            self.patch_encoder = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.global_update_in = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.global_update_h = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.global_fuse_proj = nn.ModuleDict()
+            gate_layers = []
+            for i in range(self.global_start_layer, self.global_end_layer + 1):
+                if (i - self.global_start_layer) % self.global_fusion_every == 0:
+                    self.global_fusion_layers.append(i)
+                    self.global_fuse_proj[str(i)] = nn.Linear(config.n_embd, config.n_embd, bias=False)
+                    gate_layers.append(i)
+            self.global_fusion_gate_idx = {layer: j for j, layer in enumerate(gate_layers)}
+            self.global_fuse_gates = nn.Parameter(torch.zeros(len(gate_layers)))
+        else:
+            self.patch_encoder = None
+            self.global_update_in = None
+            self.global_update_h = None
+            self.global_fuse_proj = nn.ModuleDict()
+            self.global_fuse_gates = nn.Parameter(torch.zeros(0))
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -215,6 +249,13 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        if self.global_enabled:
+            torch.nn.init.uniform_(self.patch_encoder.weight, -s, s)
+            torch.nn.init.uniform_(self.global_update_in.weight, -s, s)
+            torch.nn.init.uniform_(self.global_update_h.weight, -s, s)
+            for proj in self.global_fuse_proj.values():
+                torch.nn.init.zeros_(proj.weight)
+            self.global_fuse_gates.zero_()
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -239,6 +280,40 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
+
+    def _build_global_context(self, x):
+        """
+        Build causal global patch context from token states x.
+        Context for patch p only depends on patches < p.
+        """
+        B, T, C = x.shape
+        k = self.global_patch_size
+        n_patch = (T + k - 1) // k
+        pad_t = n_patch * k - T
+        if pad_t > 0:
+            x = F.pad(x, (0, 0, 0, pad_t))
+        patch_tokens = x.view(B, n_patch, k, C)
+        patch_summary = patch_tokens.mean(dim=2)
+        patch_summary = self.patch_encoder(patch_summary)
+
+        h = patch_summary.new_zeros(B, C)
+        patch_prev = []
+        patch_after = []
+        for p in range(n_patch):
+            patch_prev.append(h)
+            h = torch.tanh(self.global_update_in(patch_summary[:, p]) + self.global_update_h(h))
+            patch_after.append(h)
+        patch_prev = torch.stack(patch_prev, dim=1)
+        patch_after = torch.stack(patch_after, dim=1)
+
+        token_prev = patch_prev.unsqueeze(2).expand(B, n_patch, k, C).reshape(B, n_patch * k, C)[:, :T]
+
+        # For auxiliary loss: use state after patch p to predict tokens in patch p+1.
+        token_next = patch_after.new_zeros(B, n_patch, C)
+        if n_patch > 1:
+            token_next[:, 1:] = patch_after[:, :-1]
+        token_next = token_next.unsqueeze(2).expand(B, n_patch, k, C).reshape(B, n_patch * k, C)[:, :T]
+        return token_prev, token_next
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -304,8 +379,9 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        global_scalars = self.global_fuse_gates.numel()
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel() + global_scalars)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -333,14 +409,21 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        global_matrices = 0 if not self.global_enabled else (
+            self.patch_encoder.weight.numel() +
+            self.global_update_in.weight.numel() +
+            self.global_update_h.weight.numel() +
+            sum(p.weight.numel() for p in self.global_fuse_proj.values())
+        )
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.global_fuse_gates.numel()
+        total = wte + value_embeds + lm_head + transformer_matrices + global_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'global_matrices': global_matrices,
             'scalars': scalars,
             'total': total,
         }
@@ -351,12 +434,20 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
+        global_matrix_params = []
+        if self.global_enabled:
+            global_matrix_params.extend(self.patch_encoder.parameters())
+            global_matrix_params.extend(self.global_update_in.parameters())
+            global_matrix_params.extend(self.global_update_h.parameters())
+            global_matrix_params.extend(self.global_fuse_proj.parameters())
+        matrix_params = matrix_params + global_matrix_params
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        global_gate_params = [self.global_fuse_gates]
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(global_gate_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -371,6 +462,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        if self.global_fuse_gates.numel() > 0:
+            param_groups.append(dict(kind='adamw', params=global_gate_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -385,7 +478,17 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction='mean',
+        global_aux_weight=0.0,
+        global_gate_l1=0.0,
+        disable_global_fusion=False,
+        return_global_stats=False,
+    ):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -400,8 +503,16 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        global_ctx_tokens = None
+        global_next_tokens = None
+        if self.global_enabled and kv_cache is None:
+            global_ctx_tokens, global_next_tokens = self._build_global_context(x)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            if (self.global_enabled and not disable_global_fusion and kv_cache is None and i in self.global_fusion_layers):
+                gate_idx = self.global_fusion_gate_idx[i]
+                gate = torch.sigmoid(self.global_fuse_gates[gate_idx])
+                x = x + gate * self.global_fuse_proj[str(i)](norm(global_ctx_tokens))
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
@@ -416,7 +527,30 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss_main = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss_aux = logits.new_zeros(())
+            loss_gate = logits.new_zeros(())
+            if (
+                self.global_enabled
+                and kv_cache is None
+                and global_aux_weight > 0.0
+                and loss_reduction == 'mean'
+                and global_next_tokens is not None
+            ):
+                global_logits = self.lm_head(global_next_tokens)
+                global_logits = global_logits[..., :self.config.vocab_size].float()
+                global_logits = softcap * torch.tanh(global_logits / softcap)
+                loss_aux = F.cross_entropy(global_logits.view(-1, global_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
+            if self.global_enabled and global_gate_l1 > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
+                gate_vals = torch.sigmoid(self.global_fuse_gates)
+                loss_gate = gate_vals.abs().mean()
+            loss = loss_main + global_aux_weight * loss_aux + global_gate_l1 * loss_gate
+            if return_global_stats:
+                gate_mean = torch.sigmoid(self.global_fuse_gates).mean() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
+                gate_min = torch.sigmoid(self.global_fuse_gates).min() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
+                gate_max = torch.sigmoid(self.global_fuse_gates).max() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
+                ctx_norm = global_ctx_tokens.norm(dim=-1).mean() if global_ctx_tokens is not None else logits.new_zeros(())
+                return loss, loss_main.detach(), loss_aux.detach(), loss_gate.detach(), gate_mean.detach(), gate_min.detach(), gate_max.detach(), ctx_norm.detach()
             return loss
         else:
             # inference: just return the logits directly

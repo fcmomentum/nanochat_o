@@ -26,6 +26,14 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "global_patch_size" not in model_config_kwargs:
+        model_config_kwargs["global_patch_size"] = -1
+    if "global_start_layer" not in model_config_kwargs:
+        model_config_kwargs["global_start_layer"] = -1
+    if "global_end_layer" not in model_config_kwargs:
+        model_config_kwargs["global_end_layer"] = -1
+    if "global_fusion_every" not in model_config_kwargs:
+        model_config_kwargs["global_fusion_every"] = 2
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -38,6 +46,8 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    if "global_fuse_gates" not in model_data:
+        model_data["global_fuse_gates"] = torch.zeros(0)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
