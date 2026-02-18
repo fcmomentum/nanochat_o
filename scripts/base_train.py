@@ -57,6 +57,8 @@ parser.add_argument("--global-end-layer", type=int, default=-1, help="last layer
 parser.add_argument("--global-fusion-every", type=int, default=2, help="fuse global context every N layers in [global_start_layer, global_end_layer]")
 parser.add_argument("--global-aux-weight", type=float, default=0.1, help="aux CE weight for predicting next patch tokens from global state")
 parser.add_argument("--global-gate-l1", type=float, default=0.0, help="L1 regularization weight on global fusion gates")
+parser.add_argument("--global-gate-target", type=float, default=0.3, help="target value for sigmoid(global gates)")
+parser.add_argument("--global-gate-target-weight", type=float, default=0.0, help="quadratic penalty weight for keeping global gates near target")
 parser.add_argument("--global-ablation-every", type=int, default=500, help="measure loss delta with global fusion disabled every N steps (-1 disables)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -70,6 +72,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--global-gate-lr", type=float, default=0.02, help="learning rate for global fusion gates")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
@@ -335,6 +338,7 @@ optimizer = model.setup_optimizer(
     weight_decay=weight_decay_scaled,
     adam_betas=adam_betas,
     scalar_lr=args.scalar_lr * batch_lr_scale,
+    global_gate_lr=args.global_gate_lr * batch_lr_scale,
 )
 
 if resuming:
@@ -491,11 +495,13 @@ while True:
         ablation_x = x
         ablation_y = y
         with autocast_ctx:
-            loss, train_loss_main, train_loss_aux, train_loss_gate, gate_mean, gate_min, gate_max, ctx_norm = model(
+            loss, train_loss_main, train_loss_aux, train_loss_gate, train_loss_gate_target, gate_mean, gate_min, gate_max, ctx_norm = model(
                 x,
                 y,
                 global_aux_weight=args.global_aux_weight,
                 global_gate_l1=args.global_gate_l1,
+                global_gate_target=args.global_gate_target,
+                global_gate_target_weight=args.global_gate_target_weight,
                 return_global_stats=True,
             )
         train_loss = loss.detach() # for logging
@@ -517,6 +523,7 @@ while True:
     train_loss_main_f = train_loss_main.item()
     train_loss_aux_f = train_loss_aux.item()
     train_loss_gate_f = train_loss_gate.item()
+    train_loss_gate_target_f = train_loss_gate_target.item()
     gate_mean_f = gate_mean.item()
     gate_min_f = gate_min.item()
     gate_max_f = gate_max.item()
@@ -530,11 +537,13 @@ while True:
     )
     if should_run_ablation:
         with torch.no_grad(), autocast_ctx:
-            loss_no_global, _, _, _, _, _, _, _ = model(
+            loss_no_global, _, _, _, _, _, _, _, _ = model(
                 ablation_x,
                 ablation_y,
                 global_aux_weight=args.global_aux_weight,
                 global_gate_l1=args.global_gate_l1,
+                global_gate_target=args.global_gate_target,
+                global_gate_target_weight=args.global_gate_target_weight,
                 disable_global_fusion=True,
                 return_global_stats=True,
             )
@@ -576,6 +585,7 @@ while True:
             "train/loss_main": train_loss_main_f,
             "train/loss_global_aux": train_loss_aux_f,
             "train/loss_global_gate_reg": train_loss_gate_f,
+            "train/loss_global_gate_target_reg": train_loss_gate_target_f,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
@@ -587,6 +597,8 @@ while True:
             "global/context_norm": ctx_norm_f,
             "global/aux_weight": args.global_aux_weight,
             "global/patch_size": args.global_patch_size,
+            "global/gate_target": args.global_gate_target,
+            "global/gate_target_weight": args.global_gate_target_weight,
             "global/ablation_loss_delta": ablation_loss_delta_f,
             "global/ablation_loss_ratio": ablation_loss_ratio_f,
         }

@@ -428,7 +428,16 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+        global_gate_lr=0.02,
+    ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -463,7 +472,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
         if self.global_fuse_gates.numel() > 0:
-            param_groups.append(dict(kind='adamw', params=global_gate_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=global_gate_params, lr=global_gate_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -486,6 +495,8 @@ class GPT(nn.Module):
         loss_reduction='mean',
         global_aux_weight=0.0,
         global_gate_l1=0.0,
+        global_gate_target=0.3,
+        global_gate_target_weight=0.0,
         disable_global_fusion=False,
         return_global_stats=False,
     ):
@@ -530,6 +541,7 @@ class GPT(nn.Module):
             loss_main = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             loss_aux = logits.new_zeros(())
             loss_gate = logits.new_zeros(())
+            loss_gate_target = logits.new_zeros(())
             if (
                 self.global_enabled
                 and kv_cache is None
@@ -544,13 +556,27 @@ class GPT(nn.Module):
             if self.global_enabled and global_gate_l1 > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
                 gate_vals = torch.sigmoid(self.global_fuse_gates)
                 loss_gate = gate_vals.abs().mean()
-            loss = loss_main + global_aux_weight * loss_aux + global_gate_l1 * loss_gate
+            if self.global_enabled and global_gate_target_weight > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
+                gate_vals = torch.sigmoid(self.global_fuse_gates)
+                target = gate_vals.new_full(gate_vals.shape, global_gate_target)
+                loss_gate_target = (gate_vals - target).square().mean()
+            loss = loss_main + global_aux_weight * loss_aux + global_gate_l1 * loss_gate + global_gate_target_weight * loss_gate_target
             if return_global_stats:
                 gate_mean = torch.sigmoid(self.global_fuse_gates).mean() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
                 gate_min = torch.sigmoid(self.global_fuse_gates).min() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
                 gate_max = torch.sigmoid(self.global_fuse_gates).max() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
                 ctx_norm = global_ctx_tokens.norm(dim=-1).mean() if global_ctx_tokens is not None else logits.new_zeros(())
-                return loss, loss_main.detach(), loss_aux.detach(), loss_gate.detach(), gate_mean.detach(), gate_min.detach(), gate_max.detach(), ctx_norm.detach()
+                return (
+                    loss,
+                    loss_main.detach(),
+                    loss_aux.detach(),
+                    loss_gate.detach(),
+                    loss_gate_target.detach(),
+                    gate_mean.detach(),
+                    gate_min.detach(),
+                    gate_max.detach(),
+                    ctx_norm.detach(),
+                )
             return loss
         else:
             # inference: just return the logits directly
