@@ -231,7 +231,7 @@ class GPT(nn.Module):
                 if (i - self.global_start_layer) % self.global_fusion_every == 0:
                     self.global_fusion_layers.append(i)
                     self.global_fuse_proj[str(i)] = nn.Linear(config.n_embd, config.n_embd, bias=False)
-                    self.global_fuse_token_gate[str(i)] = nn.Linear(2 * config.n_embd, 1, bias=True)
+                    self.global_fuse_token_gate[str(i)] = nn.Linear(2 * config.n_embd, 1, bias=False)
                     gate_layers.append(i)
             self.global_fusion_gate_idx = {layer: j for j, layer in enumerate(gate_layers)}
             self.global_fuse_gates = nn.Parameter(torch.zeros(len(gate_layers)))
@@ -308,7 +308,6 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(proj.weight)
             for gate in self.global_fuse_token_gate.values():
                 torch.nn.init.zeros_(gate.weight)
-                torch.nn.init.constant_(gate.bias, -4.0)  # start near-zero like scalar gate
             # Start global fusion nearly off; let training open it gradually.
             self.global_fuse_gates.fill_(-4.0)
 
@@ -463,7 +462,7 @@ class GPT(nn.Module):
             self.global_align_proj.weight.numel() +
             self.global_teacher_proj.weight.numel() +
             sum(p.weight.numel() for p in self.global_fuse_proj.values()) +
-            sum(p.weight.numel() + (p.bias.numel() if p.bias is not None else 0) for p in self.global_fuse_token_gate.values())
+            sum(p.weight.numel() for p in self.global_fuse_token_gate.values())
         )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.global_fuse_gates.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + global_matrices + scalars
@@ -600,7 +599,7 @@ class GPT(nn.Module):
                 gctx_norm = norm(global_ctx_tokens)
                 # Detach global context in gate input to prevent gradient backflow through the gate
                 token_gate_in = torch.cat([x_norm, gctx_norm.detach()], dim=-1)
-                token_gate = torch.sigmoid(self.global_fuse_token_gate[str(i)](token_gate_in))  # (B, T, 1) scalar gate
+                token_gate = torch.sigmoid(self.global_fuse_token_gate[str(i)](token_gate_in) - 4.0)  # (B, T, 1) scalar gate, offset so init ≈ 0.018
                 token_gate_means.append(token_gate.mean())
                 token_gate_mins.append(token_gate.min())
                 token_gate_maxs.append(token_gate.max())
