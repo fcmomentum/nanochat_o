@@ -485,7 +485,11 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    ablation_x = None
+    ablation_y = None
     for micro_step in range(grad_accum_steps):
+        ablation_x = x
+        ablation_y = y
         with autocast_ctx:
             loss, train_loss_main, train_loss_aux, train_loss_gate, gate_mean, gate_min, gate_max, ctx_norm = model(
                 x,
@@ -527,8 +531,8 @@ while True:
     if should_run_ablation:
         with torch.no_grad(), autocast_ctx:
             loss_no_global, _, _, _, _, _, _, _ = model(
-                x,
-                y,
+                ablation_x,
+                ablation_y,
                 global_aux_weight=args.global_aux_weight,
                 global_gate_l1=args.global_gate_l1,
                 disable_global_fusion=True,
