@@ -43,6 +43,7 @@ class GPTConfig:
     global_end_layer: int = -1
     global_fusion_every: int = 2
     global_patch_layers: int = 4
+    global_align_dim: int = 256
 
 
 def norm(x):
@@ -220,6 +221,8 @@ class GPT(nn.Module):
         if self.global_enabled:
             self.patch_encoder = nn.Linear(config.n_embd, config.n_embd, bias=False)
             self.patch_transformer = nn.ModuleList([PatchBlock(config) for _ in range(self.global_patch_layers)])
+            self.global_align_proj = nn.Linear(config.n_embd, config.global_align_dim, bias=False)
+            self.global_teacher_proj = nn.Linear(config.n_embd, config.global_align_dim, bias=False)
             self.global_fuse_proj = nn.ModuleDict()
             gate_layers = []
             for i in range(self.global_start_layer + 1, self.global_end_layer + 1):
@@ -232,6 +235,8 @@ class GPT(nn.Module):
         else:
             self.patch_encoder = None
             self.patch_transformer = nn.ModuleList()
+            self.global_align_proj = None
+            self.global_teacher_proj = None
             self.global_fuse_proj = nn.ModuleDict()
             self.global_fuse_gates = nn.Parameter(torch.zeros(0))
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -293,6 +298,8 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(block.attn.c_proj.weight)
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.uniform_(self.global_align_proj.weight, -s, s)
+            torch.nn.init.uniform_(self.global_teacher_proj.weight, -s, s)
             for proj in self.global_fuse_proj.values():
                 torch.nn.init.zeros_(proj.weight)
             self.global_fuse_gates.zero_()
@@ -445,6 +452,8 @@ class GPT(nn.Module):
         global_matrices = 0 if not self.global_enabled else (
             self.patch_encoder.weight.numel() +
             sum(p.numel() for p in self.patch_transformer.parameters()) +
+            self.global_align_proj.weight.numel() +
+            self.global_teacher_proj.weight.numel() +
             sum(p.weight.numel() for p in self.global_fuse_proj.values())
         )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.global_fuse_gates.numel()
@@ -479,6 +488,8 @@ class GPT(nn.Module):
         if self.global_enabled:
             global_matrix_params.extend(self.patch_encoder.parameters())
             global_matrix_params.extend(self.patch_transformer.parameters())
+            global_matrix_params.extend(self.global_align_proj.parameters())
+            global_matrix_params.extend(self.global_teacher_proj.parameters())
             global_matrix_params.extend(self.global_fuse_proj.parameters())
         matrix_params = matrix_params + global_matrix_params
         value_embeds_params = list(self.value_embeds.parameters())
@@ -525,6 +536,7 @@ class GPT(nn.Module):
         kv_cache=None,
         loss_reduction='mean',
         global_aux_weight=0.0,
+        global_align_weight=0.0,
         global_gate_l1=0.0,
         global_gate_target=0.3,
         global_gate_target_weight=0.0,
@@ -547,6 +559,8 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         global_ctx_tokens = None
         global_next_tokens = None
+        align_teacher_tokens = None
+        final_fusion_layer = self.global_fusion_layers[-1] if self.global_fusion_layers else None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             if (
@@ -564,6 +578,14 @@ class GPT(nn.Module):
             if (self.global_enabled and kv_cache is None and i == self.global_start_layer):
                 # Patchify after this token layer, then run patch-level causal transformer.
                 global_ctx_tokens, global_next_tokens = self._build_global_context(x)
+            if (
+                self.global_enabled
+                and kv_cache is None
+                and final_fusion_layer is not None
+                and i == final_fusion_layer
+            ):
+                # Teacher features for alignment are taken right after the final fusion layer block.
+                align_teacher_tokens = x
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -578,6 +600,7 @@ class GPT(nn.Module):
             # TODO experiment with chunked cross-entropy?
             loss_main = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             loss_aux = logits.new_zeros(())
+            loss_align = logits.new_zeros(())
             loss_gate = logits.new_zeros(())
             loss_gate_target = logits.new_zeros(())
             if (
@@ -591,6 +614,24 @@ class GPT(nn.Module):
                 global_logits = global_logits[..., :self.config.vocab_size].float()
                 global_logits = softcap * torch.tanh(global_logits / softcap)
                 loss_aux = F.cross_entropy(global_logits.view(-1, global_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
+            if (
+                self.global_enabled
+                and kv_cache is None
+                and global_align_weight > 0.0
+                and loss_reduction == 'mean'
+                and global_next_tokens is not None
+            ):
+                z_global = F.normalize(self.global_align_proj(norm(global_next_tokens)), dim=-1)
+                teacher_tokens = align_teacher_tokens if align_teacher_tokens is not None else x
+                z_teacher = F.normalize(self.global_teacher_proj(norm(teacher_tokens.detach())), dim=-1)
+                align_dist = 1.0 - (z_global * z_teacher).sum(dim=-1)  # (B, T)
+                valid_mask = targets != -1
+                # patch 0 has no previous-patch global context by design
+                patch_ids = torch.arange(T, device=idx.device) // self.global_patch_size
+                valid_mask = valid_mask & (patch_ids.unsqueeze(0) > 0)
+                denom = valid_mask.sum()
+                if denom > 0:
+                    loss_align = (align_dist * valid_mask.float()).sum() / denom
             if self.global_enabled and global_gate_l1 > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
                 gate_vals = torch.sigmoid(self.global_fuse_gates)
                 loss_gate = gate_vals.abs().mean()
@@ -598,7 +639,13 @@ class GPT(nn.Module):
                 gate_vals = torch.sigmoid(self.global_fuse_gates)
                 target = gate_vals.new_full(gate_vals.shape, global_gate_target)
                 loss_gate_target = (gate_vals - target).square().mean()
-            loss = loss_main + global_aux_weight * loss_aux + global_gate_l1 * loss_gate + global_gate_target_weight * loss_gate_target
+            loss = (
+                loss_main
+                + global_aux_weight * loss_aux
+                + global_align_weight * loss_align
+                + global_gate_l1 * loss_gate
+                + global_gate_target_weight * loss_gate_target
+            )
             if return_global_stats:
                 gate_mean = torch.sigmoid(self.global_fuse_gates).mean() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
                 gate_min = torch.sigmoid(self.global_fuse_gates).min() if self.global_fuse_gates.numel() > 0 else logits.new_zeros(())
@@ -608,6 +655,7 @@ class GPT(nn.Module):
                     loss,
                     loss_main.detach(),
                     loss_aux.detach(),
+                    loss_align.detach(),
                     loss_gate.detach(),
                     loss_gate_target.detach(),
                     gate_mean.detach(),

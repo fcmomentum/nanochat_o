@@ -56,7 +56,9 @@ parser.add_argument("--global-start-layer", type=int, default=-1, help="first la
 parser.add_argument("--global-end-layer", type=int, default=-1, help="last layer for global stream/fusion (-1 = auto)")
 parser.add_argument("--global-fusion-every", type=int, default=2, help="fuse global context every N layers in [global_start_layer, global_end_layer]")
 parser.add_argument("--global-patch-layers", type=int, default=4, help="number of causal transformer layers in the global patch branch")
+parser.add_argument("--global-align-dim", type=int, default=256, help="projection dimension for global-token feature alignment loss")
 parser.add_argument("--global-aux-weight", type=float, default=0.1, help="aux CE weight for predicting next patch tokens from global state")
+parser.add_argument("--global-align-weight", type=float, default=0.0, help="feature alignment loss weight between global-next tokens and final token features")
 parser.add_argument("--global-gate-l1", type=float, default=0.0, help="L1 regularization weight on global fusion gates")
 parser.add_argument("--global-gate-target", type=float, default=0.3, help="target value for sigmoid(global gates)")
 parser.add_argument("--global-gate-target-weight", type=float, default=0.0, help="quadratic penalty weight for keeping global gates near target")
@@ -149,6 +151,7 @@ def build_model_meta(depth):
         global_end_layer=args.global_end_layer,
         global_fusion_every=args.global_fusion_every,
         global_patch_layers=args.global_patch_layers,
+        global_align_dim=args.global_align_dim,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -497,10 +500,11 @@ while True:
         ablation_x = x
         ablation_y = y
         with autocast_ctx:
-            loss, train_loss_main, train_loss_aux, train_loss_gate, train_loss_gate_target, gate_mean, gate_min, gate_max, ctx_norm = model(
+            loss, train_loss_main, train_loss_aux, train_loss_align, train_loss_gate, train_loss_gate_target, gate_mean, gate_min, gate_max, ctx_norm = model(
                 x,
                 y,
                 global_aux_weight=args.global_aux_weight,
+                global_align_weight=args.global_align_weight,
                 global_gate_l1=args.global_gate_l1,
                 global_gate_target=args.global_gate_target,
                 global_gate_target_weight=args.global_gate_target_weight,
@@ -524,6 +528,7 @@ while True:
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     train_loss_main_f = train_loss_main.item()
     train_loss_aux_f = train_loss_aux.item()
+    train_loss_align_f = train_loss_align.item()
     train_loss_gate_f = train_loss_gate.item()
     train_loss_gate_target_f = train_loss_gate_target.item()
     gate_mean_f = gate_mean.item()
@@ -539,10 +544,11 @@ while True:
     )
     if should_run_ablation:
         with torch.no_grad(), autocast_ctx:
-            loss_no_global, _, _, _, _, _, _, _, _ = model(
+            loss_no_global, _, _, _, _, _, _, _, _, _ = model(
                 ablation_x,
                 ablation_y,
                 global_aux_weight=args.global_aux_weight,
+                global_align_weight=args.global_align_weight,
                 global_gate_l1=args.global_gate_l1,
                 global_gate_target=args.global_gate_target,
                 global_gate_target_weight=args.global_gate_target_weight,
@@ -586,6 +592,7 @@ while True:
             "train/loss": debiased_smooth_loss,
             "train/loss_main": train_loss_main_f,
             "train/loss_global_aux": train_loss_aux_f,
+            "train/loss_global_align": train_loss_align_f,
             "train/loss_global_gate_reg": train_loss_gate_f,
             "train/loss_global_gate_target_reg": train_loss_gate_target_f,
             "train/lrm": lrm,
@@ -598,6 +605,7 @@ while True:
             "global/gate_max": gate_max_f,
             "global/context_norm": ctx_norm_f,
             "global/aux_weight": args.global_aux_weight,
+            "global/align_weight": args.global_align_weight,
             "global/patch_size": args.global_patch_size,
             "global/gate_target": args.global_gate_target,
             "global/gate_target_weight": args.global_gate_target_weight,

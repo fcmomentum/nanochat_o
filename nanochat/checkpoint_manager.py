@@ -36,6 +36,8 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["global_fusion_every"] = 2
     if "global_patch_layers" not in model_config_kwargs:
         model_config_kwargs["global_patch_layers"] = 4
+    if "global_align_dim" not in model_config_kwargs:
+        model_config_kwargs["global_align_dim"] = 256
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -50,6 +52,10 @@ def _patch_missing_keys(model_data, model_config):
         log0(f"Patching missing x0_lambdas in model data to 0.0")
     if "global_fuse_gates" not in model_data:
         model_data["global_fuse_gates"] = torch.zeros(0)
+    if model_config.global_patch_size > 0 and "global_align_proj.weight" not in model_data:
+        model_data["global_align_proj.weight"] = torch.zeros(model_config.global_align_dim, model_config.n_embd)
+    if model_config.global_patch_size > 0 and "global_teacher_proj.weight" not in model_data:
+        model_data["global_teacher_proj.weight"] = torch.zeros(model_config.global_align_dim, model_config.n_embd)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
