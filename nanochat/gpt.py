@@ -42,6 +42,7 @@ class GPTConfig:
     global_start_layer: int = -1
     global_end_layer: int = -1
     global_fusion_every: int = 2
+    global_patch_layers: int = 4
 
 
 def norm(x):
@@ -148,6 +149,41 @@ class Block(nn.Module):
         return x
 
 
+class PatchSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
+
+class PatchBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = PatchSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(norm(x))
+        x = x + self.mlp(norm(x))
+        return x
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -178,15 +214,15 @@ class GPT(nn.Module):
         if self.global_end_layer < self.global_start_layer:
             self.global_end_layer = self.global_start_layer
         self.global_fusion_every = max(1, config.global_fusion_every)
+        self.global_patch_layers = max(1, config.global_patch_layers)
         self.global_fusion_layers = []
         self.global_fusion_gate_idx = {}
         if self.global_enabled:
             self.patch_encoder = nn.Linear(config.n_embd, config.n_embd, bias=False)
-            self.global_update_in = nn.Linear(config.n_embd, config.n_embd, bias=False)
-            self.global_update_h = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.patch_transformer = nn.ModuleList([PatchBlock(config) for _ in range(self.global_patch_layers)])
             self.global_fuse_proj = nn.ModuleDict()
             gate_layers = []
-            for i in range(self.global_start_layer, self.global_end_layer + 1):
+            for i in range(self.global_start_layer + 1, self.global_end_layer + 1):
                 if (i - self.global_start_layer) % self.global_fusion_every == 0:
                     self.global_fusion_layers.append(i)
                     self.global_fuse_proj[str(i)] = nn.Linear(config.n_embd, config.n_embd, bias=False)
@@ -195,8 +231,7 @@ class GPT(nn.Module):
             self.global_fuse_gates = nn.Parameter(torch.zeros(len(gate_layers)))
         else:
             self.patch_encoder = None
-            self.global_update_in = None
-            self.global_update_h = None
+            self.patch_transformer = nn.ModuleList()
             self.global_fuse_proj = nn.ModuleDict()
             self.global_fuse_gates = nn.Parameter(torch.zeros(0))
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -251,8 +286,13 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         if self.global_enabled:
             torch.nn.init.uniform_(self.patch_encoder.weight, -s, s)
-            torch.nn.init.uniform_(self.global_update_in.weight, -s, s)
-            torch.nn.init.uniform_(self.global_update_h.weight, -s, s)
+            for block in self.patch_transformer:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
             for proj in self.global_fuse_proj.values():
                 torch.nn.init.zeros_(proj.weight)
             self.global_fuse_gates.zero_()
@@ -295,24 +335,17 @@ class GPT(nn.Module):
         patch_tokens = x.view(B, n_patch, k, C)
         patch_summary = patch_tokens.mean(dim=2)
         patch_summary = self.patch_encoder(patch_summary)
+        for block in self.patch_transformer:
+            patch_summary = block(patch_summary)
 
-        h = patch_summary.new_zeros(B, C)
-        patch_prev = []
-        patch_after = []
-        for p in range(n_patch):
-            patch_prev.append(h)
-            h = torch.tanh(self.global_update_in(patch_summary[:, p]) + self.global_update_h(h))
-            patch_after.append(h)
-        patch_prev = torch.stack(patch_prev, dim=1)
-        patch_after = torch.stack(patch_after, dim=1)
-
+        # Shift by one patch so token/patch p only gets context from < p.
+        patch_prev = patch_summary.new_zeros(B, n_patch, C)
+        if n_patch > 1:
+            patch_prev[:, 1:] = patch_summary[:, :-1]
         token_prev = patch_prev.unsqueeze(2).expand(B, n_patch, k, C).reshape(B, n_patch * k, C)[:, :T]
 
-        # For auxiliary loss: use state after patch p to predict tokens in patch p+1.
-        token_next = patch_after.new_zeros(B, n_patch, C)
-        if n_patch > 1:
-            token_next[:, 1:] = patch_after[:, :-1]
-        token_next = token_next.unsqueeze(2).expand(B, n_patch, k, C).reshape(B, n_patch * k, C)[:, :T]
+        # Next-patch auxiliary uses the same shifted patch state.
+        token_next = token_prev
         return token_prev, token_next
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
@@ -411,8 +444,7 @@ class GPT(nn.Module):
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         global_matrices = 0 if not self.global_enabled else (
             self.patch_encoder.weight.numel() +
-            self.global_update_in.weight.numel() +
-            self.global_update_h.weight.numel() +
+            sum(p.numel() for p in self.patch_transformer.parameters()) +
             sum(p.weight.numel() for p in self.global_fuse_proj.values())
         )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.global_fuse_gates.numel()
@@ -446,8 +478,7 @@ class GPT(nn.Module):
         global_matrix_params = []
         if self.global_enabled:
             global_matrix_params.extend(self.patch_encoder.parameters())
-            global_matrix_params.extend(self.global_update_in.parameters())
-            global_matrix_params.extend(self.global_update_h.parameters())
+            global_matrix_params.extend(self.patch_transformer.parameters())
             global_matrix_params.extend(self.global_fuse_proj.parameters())
         matrix_params = matrix_params + global_matrix_params
         value_embeds_params = list(self.value_embeds.parameters())
@@ -516,16 +547,23 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         global_ctx_tokens = None
         global_next_tokens = None
-        if self.global_enabled and kv_cache is None:
-            global_ctx_tokens, global_next_tokens = self._build_global_context(x)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            if (self.global_enabled and not disable_global_fusion and kv_cache is None and i in self.global_fusion_layers):
+            if (
+                self.global_enabled
+                and not disable_global_fusion
+                and kv_cache is None
+                and global_ctx_tokens is not None
+                and i in self.global_fusion_layers
+            ):
                 gate_idx = self.global_fusion_gate_idx[i]
                 gate = torch.sigmoid(self.global_fuse_gates[gate_idx])
                 x = x + gate * self.global_fuse_proj[str(i)](norm(global_ctx_tokens))
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if (self.global_enabled and kv_cache is None and i == self.global_start_layer):
+                # Patchify after this token layer, then run patch-level causal transformer.
+                global_ctx_tokens, global_next_tokens = self._build_global_context(x)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

@@ -55,6 +55,7 @@ parser.add_argument("--global-patch-size", type=int, default=-1, help="enable gl
 parser.add_argument("--global-start-layer", type=int, default=-1, help="first layer for global stream/fusion (-1 = auto)")
 parser.add_argument("--global-end-layer", type=int, default=-1, help="last layer for global stream/fusion (-1 = auto)")
 parser.add_argument("--global-fusion-every", type=int, default=2, help="fuse global context every N layers in [global_start_layer, global_end_layer]")
+parser.add_argument("--global-patch-layers", type=int, default=4, help="number of causal transformer layers in the global patch branch")
 parser.add_argument("--global-aux-weight", type=float, default=0.1, help="aux CE weight for predicting next patch tokens from global state")
 parser.add_argument("--global-gate-l1", type=float, default=0.0, help="L1 regularization weight on global fusion gates")
 parser.add_argument("--global-gate-target", type=float, default=0.3, help="target value for sigmoid(global gates)")
@@ -147,6 +148,7 @@ def build_model_meta(depth):
         global_start_layer=args.global_start_layer,
         global_end_layer=args.global_end_layer,
         global_fusion_every=args.global_fusion_every,
+        global_patch_layers=args.global_patch_layers,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

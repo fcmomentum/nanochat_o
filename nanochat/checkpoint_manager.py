@@ -34,6 +34,8 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["global_end_layer"] = -1
     if "global_fusion_every" not in model_config_kwargs:
         model_config_kwargs["global_fusion_every"] = 2
+    if "global_patch_layers" not in model_config_kwargs:
+        model_config_kwargs["global_patch_layers"] = 4
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
