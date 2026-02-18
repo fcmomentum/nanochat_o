@@ -167,6 +167,7 @@ class PatchSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q, k = norm(q), norm(k)  # mirror token-stream attention stability
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -307,7 +308,8 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(proj.weight)
             for gate in self.global_fuse_token_gate.values():
                 torch.nn.init.zeros_(gate.weight)
-            self.global_fuse_gates.zero_()
+            # Start global fusion nearly off; let training open it gradually.
+            self.global_fuse_gates.fill_(-4.0)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
