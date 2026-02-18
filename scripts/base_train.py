@@ -254,7 +254,9 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# TEMPORARY: disable torch.compile for NaN debugging (set_detect_anomaly needs eager mode)
+# model = torch.compile(model, dynamic=False)
+print0("WARNING: torch.compile DISABLED for NaN debugging")
 
 # -----------------------------------------------------------------------------
 # Determine the optimization horizon based on the model size
@@ -405,6 +407,9 @@ else:
 
 # -----------------------------------------------------------------------------
 # Training loop
+# TEMPORARY: enable anomaly detection to find the exact backward op producing NaN
+torch.autograd.set_detect_anomaly(True)
+print0("WARNING: anomaly detection ENABLED — will be slow but will identify NaN source")
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
