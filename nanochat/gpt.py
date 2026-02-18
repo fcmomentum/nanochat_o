@@ -363,6 +363,83 @@ class GPT(nn.Module):
         token_next = token_prev
         return token_prev, token_next
 
+    @torch.compiler.disable
+    def _apply_global_fusion(self, x, global_ctx_tokens, layer_idx):
+        """
+        Fuse global patch context into the token stream at the given layer.
+        Runs in eager mode to avoid torch.compile backward NaN issues.
+        """
+        gate_idx = self.global_fusion_gate_idx[layer_idx]
+        scalar_gate = torch.sigmoid(self.global_fuse_gates[gate_idx])
+        x_norm = norm(x)
+        gctx_norm = norm(global_ctx_tokens)
+        # Detach global context in gate input to prevent gradient backflow through the gate
+        token_gate_in = torch.cat([x_norm, gctx_norm.detach()], dim=-1)
+        token_gate = torch.sigmoid(self.global_fuse_token_gate[str(layer_idx)](token_gate_in) - 4.0)  # (B, T, 1) scalar gate, offset so init ≈ 0.018
+        # Scale by number of fusion layers to prevent gradient fan-in
+        n_fuse = len(self.global_fusion_layers)
+        x = x + (scalar_gate * token_gate * self.global_fuse_proj[str(layer_idx)](gctx_norm)) / n_fuse
+        return x, token_gate.mean(), token_gate.min(), token_gate.max()
+
+    @torch.compiler.disable
+    def _compute_global_losses(
+        self, logits, targets, softcap, loss_reduction, kv_cache,
+        global_aux_weight, global_align_weight, global_gate_l1,
+        global_gate_target, global_gate_target_weight,
+        global_next_tokens, align_teacher_tokens, x, idx, T,
+    ):
+        """
+        Compute all global branch auxiliary losses.
+        Runs in eager mode to avoid torch.compile backward NaN issues.
+        """
+        loss_aux = logits.new_zeros(())
+        loss_align = logits.new_zeros(())
+        loss_gate = logits.new_zeros(())
+        loss_gate_target = logits.new_zeros(())
+        if (
+            self.global_enabled
+            and kv_cache is None
+            and global_aux_weight > 0.0
+            and loss_reduction == 'mean'
+            and global_next_tokens is not None
+        ):
+            global_logits = self.lm_head(global_next_tokens)
+            global_logits = global_logits[..., :self.config.vocab_size].float()
+            global_logits = softcap * torch.tanh(global_logits / softcap)
+            loss_aux = F.cross_entropy(global_logits.view(-1, global_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
+        if (
+            self.global_enabled
+            and kv_cache is None
+            and global_align_weight > 0.0
+            and loss_reduction == 'mean'
+            and global_next_tokens is not None
+        ):
+            z_global = F.normalize(self.global_align_proj(norm(global_next_tokens)), dim=-1, eps=1e-6)
+            teacher_tokens = align_teacher_tokens if align_teacher_tokens is not None else x
+            z_teacher = F.normalize(self.global_teacher_proj(norm(teacher_tokens.detach())), dim=-1, eps=1e-6)
+            align_dist = 1.0 - (z_global * z_teacher).sum(dim=-1)  # (B, T)
+            align_dist = torch.nan_to_num(align_dist, nan=0.0, posinf=2.0, neginf=0.0)
+            valid_mask = targets != -1
+            # patch 0 has no previous-patch global context by design
+            patch_ids = torch.arange(T, device=idx.device) // self.global_patch_size
+            valid_mask = valid_mask & (patch_ids.unsqueeze(0) > 0)
+            denom = valid_mask.sum()
+            if denom > 0:
+                loss_align = (align_dist * valid_mask.float()).sum() / denom
+        if self.global_enabled and global_gate_l1 > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
+            gate_vals = torch.sigmoid(self.global_fuse_gates)
+            loss_gate = gate_vals.abs().mean()
+        if self.global_enabled and global_gate_target_weight > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
+            gate_vals = torch.sigmoid(self.global_fuse_gates)
+            target = gate_vals.new_full(gate_vals.shape, global_gate_target)
+            loss_gate_target = (gate_vals - target).square().mean()
+        # Guard auxiliary terms against accidental NaN/Inf propagation.
+        loss_aux = torch.nan_to_num(loss_aux, nan=0.0, posinf=0.0, neginf=0.0)
+        loss_align = torch.nan_to_num(loss_align, nan=0.0, posinf=0.0, neginf=0.0)
+        loss_gate = torch.nan_to_num(loss_gate, nan=0.0, posinf=0.0, neginf=0.0)
+        loss_gate_target = torch.nan_to_num(loss_gate_target, nan=0.0, posinf=0.0, neginf=0.0)
+        return loss_aux, loss_align, loss_gate, loss_gate_target
+
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
@@ -604,7 +681,7 @@ class GPT(nn.Module):
                 and i in self.global_fusion_layers
             ):
                 x, tg_mean, tg_min, tg_max = self._apply_global_fusion(
-                    x, global_ctx_tokens, i, gate_idx,
+                    x, global_ctx_tokens, i,
                 )
                 token_gate_means.append(tg_mean)
                 token_gate_mins.append(tg_min)
@@ -638,52 +715,12 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss_main = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            loss_aux = logits.new_zeros(())
-            loss_align = logits.new_zeros(())
-            loss_gate = logits.new_zeros(())
-            loss_gate_target = logits.new_zeros(())
-            if (
-                self.global_enabled
-                and kv_cache is None
-                and global_aux_weight > 0.0
-                and loss_reduction == 'mean'
-                and global_next_tokens is not None
-            ):
-                global_logits = self.lm_head(global_next_tokens)
-                global_logits = global_logits[..., :self.config.vocab_size].float()
-                global_logits = softcap * torch.tanh(global_logits / softcap)
-                loss_aux = F.cross_entropy(global_logits.view(-1, global_logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='mean')
-            if (
-                self.global_enabled
-                and kv_cache is None
-                and global_align_weight > 0.0
-                and loss_reduction == 'mean'
-                and global_next_tokens is not None
-            ):
-                z_global = F.normalize(self.global_align_proj(norm(global_next_tokens)), dim=-1, eps=1e-6)
-                teacher_tokens = align_teacher_tokens if align_teacher_tokens is not None else x
-                z_teacher = F.normalize(self.global_teacher_proj(norm(teacher_tokens.detach())), dim=-1, eps=1e-6)
-                align_dist = 1.0 - (z_global * z_teacher).sum(dim=-1)  # (B, T)
-                align_dist = torch.nan_to_num(align_dist, nan=0.0, posinf=2.0, neginf=0.0)
-                valid_mask = targets != -1
-                # patch 0 has no previous-patch global context by design
-                patch_ids = torch.arange(T, device=idx.device) // self.global_patch_size
-                valid_mask = valid_mask & (patch_ids.unsqueeze(0) > 0)
-                denom = valid_mask.sum()
-                if denom > 0:
-                    loss_align = (align_dist * valid_mask.float()).sum() / denom
-            if self.global_enabled and global_gate_l1 > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
-                gate_vals = torch.sigmoid(self.global_fuse_gates)
-                loss_gate = gate_vals.abs().mean()
-            if self.global_enabled and global_gate_target_weight > 0.0 and self.global_fuse_gates.numel() > 0 and loss_reduction == 'mean':
-                gate_vals = torch.sigmoid(self.global_fuse_gates)
-                target = gate_vals.new_full(gate_vals.shape, global_gate_target)
-                loss_gate_target = (gate_vals - target).square().mean()
-            # Guard auxiliary terms against accidental NaN/Inf propagation.
-            loss_aux = torch.nan_to_num(loss_aux, nan=0.0, posinf=0.0, neginf=0.0)
-            loss_align = torch.nan_to_num(loss_align, nan=0.0, posinf=0.0, neginf=0.0)
-            loss_gate = torch.nan_to_num(loss_gate, nan=0.0, posinf=0.0, neginf=0.0)
-            loss_gate_target = torch.nan_to_num(loss_gate_target, nan=0.0, posinf=0.0, neginf=0.0)
+            loss_aux, loss_align, loss_gate, loss_gate_target = self._compute_global_losses(
+                logits, targets, softcap, loss_reduction, kv_cache,
+                global_aux_weight, global_align_weight, global_gate_l1,
+                global_gate_target, global_gate_target_weight,
+                global_next_tokens, align_teacher_tokens, x, idx, T,
+            )
             loss = (
                 loss_main
                 + global_aux_weight * loss_aux

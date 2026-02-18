@@ -254,9 +254,7 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# TEMPORARY: disable torch.compile for NaN debugging (set_detect_anomaly needs eager mode)
-# model = torch.compile(model, dynamic=False)
-print0("WARNING: torch.compile DISABLED for NaN debugging")
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Determine the optimization horizon based on the model size
@@ -407,9 +405,6 @@ else:
 
 # -----------------------------------------------------------------------------
 # Training loop
-# TEMPORARY: enable anomaly detection to find the exact backward op producing NaN
-torch.autograd.set_detect_anomaly(True)
-print0("WARNING: anomaly detection ENABLED — will be slow but will identify NaN source")
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -523,40 +518,16 @@ while True:
             )
         if not torch.isfinite(loss):
             nonfinite_this_step = True
-            # Diagnostic: which loss component is non-finite?
-            print0(f"  NaN diagnostic: loss={loss.item()}, main={train_loss_main.item()}, aux={train_loss_aux.item()}, align={train_loss_align.item()}, gate={train_loss_gate.item()}, gate_target={train_loss_gate_target.item()}")
-            print0(f"  gate_mean={gate_mean.item()}, ctx_norm={ctx_norm.item()}")
             break
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
-        # Diagnostic: check for NaN gradients after backward
-        if step < 5:
-            nan_grads = []
-            for name, p in orig_model.named_parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    nan_grads.append((name, p.grad.norm().item(), p.shape))
-            if nan_grads:
-                print0(f"  NaN gradients at step {step}, micro_step {micro_step}:")
-                for name, gnorm, shape in nan_grads[:10]:
-                    print0(f"    {name}: grad_norm={gnorm}, shape={shape}")
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     if nonfinite_this_step:
         model.zero_grad(set_to_none=True)
         nonfinite_steps += 1
         epoch = dataloader_state_dict["epoch"]
         print0(f"step {step:05d}/{num_iterations:05d} | non-finite loss detected, skipping optimizer step | epoch: {epoch}")
-        # Diagnostic: check if any parameters are NaN (would indicate previous step's optimizer corrupted them)
-        nan_params = []
-        for name, p in orig_model.named_parameters():
-            if not torch.isfinite(p).all():
-                nan_params.append((name, p.norm().item(), p.shape))
-        if nan_params:
-            print0(f"  NaN parameters detected ({len(nan_params)} total):")
-            for name, pnorm, shape in nan_params[:10]:
-                print0(f"    {name}: norm={pnorm}, shape={shape}")
-        else:
-            print0(f"  All parameters are finite — NaN is from forward computation itself")
         wandb_run.log({
             "step": step,
             "train/nonfinite_step": 1,
@@ -574,16 +545,6 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
-    # Diagnostic: check for NaN parameters after optimizer step (first few steps only)
-    if step < 5:
-        nan_params_after = []
-        for name, p in orig_model.named_parameters():
-            if not torch.isfinite(p).all():
-                nan_params_after.append((name, p.norm().item(), p.shape))
-        if nan_params_after:
-            print0(f"  NaN params AFTER optimizer.step() at step {step} ({len(nan_params_after)} total):")
-            for name, pnorm, shape in nan_params_after[:10]:
-                print0(f"    {name}: norm={pnorm}, shape={shape}")
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     train_loss_main_f = train_loss_main.item()
