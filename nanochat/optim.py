@@ -17,7 +17,6 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -31,9 +30,9 @@ def adamw_step_fused(
     wd_t: Tensor,           # () - 0-D CPU tensor, weight decay
 ) -> None:
     """
-    Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+    Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update.
+    Kept as eager ops because AdamW groups can span many tensor shapes, which may
+    trigger excessive torch.compile recompilations in fullgraph mode.
     """
     # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
